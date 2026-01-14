@@ -1,8 +1,8 @@
 // Loop statuses
 export type LoopStatus = 'queued' | 'running' | 'paused' | 'completed' | 'error' | 'stopped';
 
-// Agent types
-export type AgentType = 'claude' | 'codex';
+// Agent types - now dynamic to support custom adapters
+export type AgentType = string;
 
 // Acceptance criterion
 export interface AcceptanceCriterion {
@@ -30,6 +30,7 @@ export interface Loop {
   agent: AgentType;
   status: LoopStatus;
   skipPermissions: boolean;
+  hidden?: boolean;
   issueClosed?: boolean;
   pid?: number;           // child process PID
   startedAt?: string;     // ISO timestamp
@@ -37,6 +38,7 @@ export interface Loop {
   error?: string;         // error message if status === 'error'
   workingDir: string;     // cwd for the agent
   iteration?: number;     // current iteration count
+  maxIterations?: number; // loop iteration cap
   exitReason?: string;    // why the loop exited
   // Cross-session pause/resume fields
   pausedSessionId?: string;   // Claude session ID at time of pause

@@ -142,7 +142,8 @@ export function createLoop(
   issue: Issue,
   agent: AgentType,
   skipPermissions: boolean,
-  workingDir: string
+  workingDir: string,
+  maxIterations: number = MAX_ITERATIONS_DEFAULT
 ): Loop {
   const id = generateLoopId();
   ensureLoopDir(id);
@@ -153,8 +154,10 @@ export function createLoop(
     agent,
     status: 'queued',
     skipPermissions,
+    hidden: false,
     workingDir,
     iteration: 0,
+    maxIterations,
   };
 
   // Save to state
@@ -248,7 +251,7 @@ export async function startLoop(loopId: string): Promise<void> {
   // Initialize iteration state
   const iterState: LoopIterationState = {
     iteration: 0,
-    maxIterations: MAX_ITERATIONS_DEFAULT,
+    maxIterations: loop.maxIterations ?? MAX_ITERATIONS_DEFAULT,
     circuitBreaker: createCircuitBreaker(),
     analysisHistory: [],
     sessionId: undefined,  // Will be set after first iteration
@@ -272,6 +275,7 @@ export async function startLoop(loopId: string): Promise<void> {
     status: 'running',
     startedAt: new Date().toISOString(),
     iteration: 0,
+    maxIterations: loop.maxIterations ?? MAX_ITERATIONS_DEFAULT,
   });
   saveState(state);
   emit({ type: 'started', loopId });
@@ -339,12 +343,12 @@ async function runIterationLoop(
       type: 'system',
       content: `--- Iteration ${iterState.iteration}/${iterState.maxIterations} ---`,
     });
-    emit({ type: 'iteration', loopId, iteration: iterState.iteration });
 
     // Update loop iteration count
     state = loadState();
     state = updateLoop(state, loopId, { iteration: iterState.iteration });
     saveState(state);
+    emit({ type: 'iteration', loopId, iteration: iterState.iteration });
 
     // Build spawn args - use continue if we have a session ID
     let spawnArgs: SpawnArgs;
@@ -382,6 +386,18 @@ async function runIterationLoop(
     // Record API call
     rateLimiter = recordCall(rateLimiter);
 
+    // Check for pending intervention FIRST - if process was killed for intervention,
+    // skip analysis and circuit breaker (truncated output would trigger false positives)
+    const intervention = pendingInterventions.get(loopId);
+    if (intervention) {
+      pendingInterventions.delete(loopId);
+      appendLog(loopId, { type: 'system', content: 'Injecting operator intervention into next prompt' });
+      // Reset circuit breaker to avoid false triggers from truncated output
+      iterState.circuitBreaker = createCircuitBreaker();
+      currentPrompt = `OPERATOR INTERVENTION:\n${intervention}\n\nPlease acknowledge this message and adjust your approach accordingly. Continue working on the task.`;
+      continue;
+    }
+
     // Analyze response with git baseline
     const analysis = analyzeResponse(outputBuffer, loop.workingDir, gitBaseline);
     iterState.analysisHistory.push(analysis);
@@ -396,8 +412,11 @@ async function runIterationLoop(
     iterState.circuitBreaker = recordIteration(iterState.circuitBreaker, analysis);
     appendLog(loopId, { type: 'system', content: `Circuit: ${getCbStatus(iterState.circuitBreaker)}` });
 
-    const allCriteriaComplete = currentLoop.issue.acceptanceCriteria.length === 0 ||
-      currentLoop.issue.acceptanceCriteria.every(criterion => criterion.completed);
+    // Reload state to get fresh criteria (may have been updated during iteration via streaming tags)
+    const freshState = loadState();
+    const freshLoop = freshState.loops.find(l => l.id === loopId);
+    const criteria = freshLoop?.issue.acceptanceCriteria || [];
+    const allCriteriaComplete = criteria.length === 0 || criteria.every(c => c.completed);
     const hasPromise = outputBuffer.includes(COMPLETION_PROMISE);
 
     // Check exit conditions
@@ -435,20 +454,11 @@ async function runIterationLoop(
         appendLog(loopId, { type: 'system', content: 'Completion promise detected with all criteria complete' });
         break;
       }
-      const remaining = getIncompleteCriteria(loop.issue.acceptanceCriteria);
+      const remaining = getIncompleteCriteria(criteria);
       appendLog(loopId, { type: 'system', content: `Completion promise received but criteria remain: ${remaining.length}` });
       currentPrompt = `You output <promise>TASK COMPLETE</promise>, but the following criteria remain:\n` +
         remaining.map(item => `- ${item}`).join('\n') +
         `\n\nComplete them and emit <criterion-complete>N</criterion-complete> for each, then output <promise>TASK COMPLETE</promise> again.`;
-      continue;
-    }
-
-    // Check for pending intervention (process was killed by operator)
-    const intervention = pendingInterventions.get(loopId);
-    if (intervention) {
-      pendingInterventions.delete(loopId);
-      appendLog(loopId, { type: 'system', content: 'Injecting operator intervention into next prompt' });
-      currentPrompt = `OPERATOR INTERVENTION:\n${intervention}\n\nPlease acknowledge this message and adjust your approach accordingly. Continue working on the task.`;
       continue;
     }
 
@@ -468,7 +478,7 @@ async function runIterationLoop(
   // Check if hit max iterations
   if (iterState.iteration >= iterState.maxIterations && !iterState.exitReason) {
     iterState.exitReason = 'max_iterations';
-    appendLog(loopId, { type: 'system', content: `Hit max iterations (${iterState.maxIterations})` });
+    appendLog(loopId, { type: 'system', content: `Max iterations reached (${iterState.maxIterations})` });
   }
 
   // Finalize loop
@@ -734,7 +744,7 @@ export async function resumePausedLoop(loopId: string): Promise<void> {
   const previousIteration = loop.iteration || 0;
   const iterState: LoopIterationState = {
     iteration: previousIteration,
-    maxIterations: MAX_ITERATIONS_DEFAULT,
+    maxIterations: loop.maxIterations ?? MAX_ITERATIONS_DEFAULT,
     circuitBreaker: createCircuitBreaker(),
     analysisHistory: [],
     sessionId: loop.pausedSessionId,  // Try to resume the session
@@ -780,9 +790,11 @@ export function stopLoop(loopId: string): void {
     let state = loadState();
     state = updateLoop(state, loopId, {
       status: 'stopped',
+      exitReason: 'user_stopped',
       endedAt: new Date().toISOString(),
     });
     saveState(state);
+    appendLog(loopId, { type: 'system', content: 'Loop stopped by user' });
     return;
   }
 
@@ -791,6 +803,7 @@ export function stopLoop(loopId: string): void {
   let state = loadState();
   state = updateLoop(state, loopId, {
     status: 'stopped',
+    exitReason: 'user_stopped',
     endedAt: new Date().toISOString(),
   });
   saveState(state);

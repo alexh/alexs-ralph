@@ -10,6 +10,9 @@ export interface SpawnArgs {
 export interface AgentAdapter {
   type: AgentType;
 
+  // Optional: human-readable display name (defaults to type)
+  displayName?: string;
+
   // Build argv array for initial prompt (no shell injection)
   buildSpawnArgs(prompt: string, skipPermissions: boolean): SpawnArgs;
 
@@ -42,4 +45,20 @@ export function getAdapter(type: AgentType): AgentAdapter | undefined {
 
 export function getAvailableAdapters(): AgentAdapter[] {
   return Array.from(adapters.values()).filter(a => a.isAvailable());
+}
+
+export function unregisterAdapter(type: string): boolean {
+  return adapters.delete(type as AgentType);
+}
+
+export function getAdapterNames(): string[] {
+  return Array.from(adapters.keys());
+}
+
+export function hasAdapter(type: string): boolean {
+  return adapters.has(type as AgentType);
+}
+
+export function clearAdapters(): void {
+  adapters.clear();
 }

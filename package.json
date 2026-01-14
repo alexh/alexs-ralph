@@ -20,7 +20,8 @@
   "license": "MIT",
   "dependencies": {
     "blessed": "^0.1.81",
-    "blessed-contrib": "^4.11.0"
+    "blessed-contrib": "^4.11.0",
+    "yaml": "^2.8.2"
   },
   "devDependencies": {
     "@types/blessed": "^0.1.25",

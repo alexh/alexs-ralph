@@ -42,13 +42,14 @@ export function createCursorInput(options: CursorInputOptions, screen: blessed.W
   let isEditing = false;
   let doneCallback: (() => void) | null = null;
 
+  const hasBorder = options.style?.border !== false;
   const box = blessed.box({
     parent: options.parent,
     top: options.top,
     left: options.left,
     width: options.width,
     height: options.height,
-    border: 'line',
+    border: hasBorder ? 'line' : undefined,
     style: options.style || { fg: 'white', bg: 'black', border: { fg: 'cyan' } },
     mouse: true,
     keyable: true,

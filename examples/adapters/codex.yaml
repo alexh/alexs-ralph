@@ -1,0 +1,35 @@
+# Codex adapter configuration example
+# Place in ~/.alex/adapters/ or ./.alex/adapters/
+
+name: codex
+displayName: Codex
+
+command: codex
+
+availability:
+  check: which
+
+spawn:
+  args:
+    - "exec"
+    - "{{#skipPermissions}}--full-auto{{/skipPermissions}}"
+    - "{{prompt}}"
+
+continue:
+  args:
+    - "exec"
+    - "resume"
+    - "{{sessionId}}"
+    - "{{#skipPermissions}}--full-auto{{/skipPermissions}}"
+    - "{{prompt}}"
+
+sessionExtraction:
+  patterns:
+    - '"sessionId"\\s*:\\s*"([^"]+)"'
+    - '"session_id"\\s*:\\s*"([^"]+)"'
+    - 'Session:\\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+
+meta:
+  version: "1.0"
+  author: alexs-ralph
+  description: OpenAI Codex CLI adapter
