@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import { Issue, AcceptanceCriterion } from './types.js';
 
 // Parse a GitHub issue URL
@@ -47,6 +47,45 @@ export async function fetchIssue(url: string): Promise<Issue> {
   }
 }
 
+export type CloseIssueResult = 'closed' | 'already_closed';
+
+// Close issue using gh CLI with optional comment
+export function closeIssue(url: string, comment?: string): CloseIssueResult {
+  if (!url) {
+    throw new Error('Missing GitHub issue URL');
+  }
+
+  const args = ['issue', 'close', url];
+  const trimmedComment = comment?.trim();
+  if (trimmedComment) {
+    args.push('--comment', trimmedComment);
+  }
+
+  try {
+    execFileSync('gh', args, {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 30000,
+    });
+    return 'closed';
+  } catch (err: any) {
+    const stderr = err?.stderr?.toString?.() || '';
+    const stdout = err?.stdout?.toString?.() || '';
+    const message = (stderr || stdout || err?.message || '').trim();
+
+    if (err?.code === 'ENOENT' || message.includes('gh: command not found')) {
+      throw new Error('GitHub CLI (gh) not found. Install from https://cli.github.com');
+    }
+
+    if (/already\s+closed/i.test(message) || /already\s+been\s+closed/i.test(message)) {
+      return 'already_closed';
+    }
+
+    const firstLine = message.split('\n')[0] || 'Unknown error';
+    throw new Error(`Failed to close issue: ${firstLine}`);
+  }
+}
+
 // Parse acceptance criteria from issue body
 // Looks for headings like "Acceptance Criteria", "Done When", "Stop Conditions"
 // Falls back to checkbox items
@@ -92,6 +131,7 @@ export function parseAcceptanceCriteria(body: string): AcceptanceCriterion[] {
       criteria.push({
         text: checkboxMatch[2].trim(),
         completed: checkboxMatch[1].toLowerCase() === 'x',
+        completedBy: checkboxMatch[1].toLowerCase() === 'x' ? 'operator' : undefined,
       });
       continue;
     }
@@ -102,6 +142,7 @@ export function parseAcceptanceCriteria(body: string): AcceptanceCriterion[] {
       criteria.push({
         text: bulletMatch[1].trim(),
         completed: false,
+        completedBy: undefined,
       });
     }
   }
@@ -111,12 +152,13 @@ export function parseAcceptanceCriteria(body: string): AcceptanceCriterion[] {
     for (const line of lines) {
       const checkboxMatch = line.match(/^[\s]*[-*]\s*\[([ xX])\]\s*(.+)/);
       if (checkboxMatch) {
-        criteria.push({
-          text: checkboxMatch[2].trim(),
-          completed: checkboxMatch[1].toLowerCase() === 'x',
-        });
-      }
+      criteria.push({
+        text: checkboxMatch[2].trim(),
+        completed: checkboxMatch[1].toLowerCase() === 'x',
+        completedBy: checkboxMatch[1].toLowerCase() === 'x' ? 'operator' : undefined,
+      });
     }
+  }
   }
 
   return criteria;
@@ -138,8 +180,12 @@ export function buildPromptFromIssue(issue: Issue): string {
 
   prompt += `## Issue Description\n${issue.body}\n\n`;
   prompt += `## Instructions\n`;
-  prompt += `Complete all acceptance criteria above. `;
-  prompt += `When finished, output the exact tag: <promise>TASK COMPLETE</promise>\n`;
+  prompt += `Complete all acceptance criteria above.\n`;
+  prompt += `Mark criteria as you finish them with:\n`;
+  prompt += `- <criterion-complete>N</criterion-complete>\n`;
+  prompt += `- <criterion-incomplete>N</criterion-incomplete> (if you need to regress)\n`;
+  prompt += `Criteria are 1-indexed based on the list above.\n`;
+  prompt += `When all criteria are complete, output the exact tag: <promise>TASK COMPLETE</promise>\n`;
 
   return prompt;
 }

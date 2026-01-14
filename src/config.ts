@@ -43,5 +43,59 @@ export const TABS = ['All', 'Running', 'Paused', 'Completed', 'Errors'] as const
 export const MAX_ITERATIONS_DEFAULT = 100;
 export const STUCK_TIMEOUT_MINUTES = 5;
 
+// Circuit breaker thresholds
+export const CB_NO_PROGRESS_THRESHOLD = 3;        // Open after N loops with no file changes
+export const CB_SAME_ERROR_THRESHOLD = 5;         // Open after N loops with same errors
+export const CB_OUTPUT_DECLINE_THRESHOLD = 0.7;   // Open if output declines >70%
+export const CB_CONSECUTIVE_TEST_THRESHOLD = 3;   // Exit after N consecutive test-only loops
+
+// Rate limiting
+export const RATE_LIMIT_CALLS_PER_HOUR = 100;
+
+// Timeouts
+export const ITERATION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes per iteration
+
 // Completion promise tag
 export const COMPLETION_PROMISE = '<promise>TASK COMPLETE</promise>';
+
+// Ralph status block patterns
+export const RALPH_STATUS_REGEX = /---RALPH_STATUS---[\s\S]*?STATUS:\s*(.*?)[\s\S]*?EXIT_SIGNAL:\s*(true|false)/i;
+
+// Detection patterns
+export const COMPLETION_PATTERNS = [
+  /\bdone\b/i,
+  /\bcomplete[d]?\b/i,
+  /\bfinished\b/i,
+  /all tasks complete/i,
+  /project complete/i,
+  /ready for review/i,
+];
+
+export const TEST_ONLY_PATTERNS = [
+  /running tests/i,
+  /npm test/i,
+  /bun test/i,
+  /pytest/i,
+  /jest/i,
+  /cargo test/i,
+  /go test/i,
+  /bats/i,
+];
+
+export const IMPLEMENTATION_PATTERNS = [
+  /implementing/i,
+  /creating/i,
+  /writing/i,
+  /adding/i,
+  /\bfunction\b/i,
+  /\bclass\b/i,
+  /refactoring/i,
+  /fixing/i,
+];
+
+export const NO_WORK_PATTERNS = [
+  /nothing to do/i,
+  /no changes/i,
+  /already implemented/i,
+  /up to date/i,
+];

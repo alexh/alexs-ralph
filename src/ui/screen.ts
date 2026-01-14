@@ -1,4 +1,5 @@
 import blessed from 'blessed';
+import { isAnyInputActive } from './cursor-input.js';
 
 export function createScreen(): blessed.Widgets.Screen {
   const screen = blessed.screen({
@@ -11,6 +12,7 @@ export function createScreen(): blessed.Widgets.Screen {
 
   // Global key bindings
   screen.key(['q', 'C-c'], () => {
+    if (isAnyInputActive()) return;
     screen.destroy();
     process.exit(0);
   });

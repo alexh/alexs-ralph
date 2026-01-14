@@ -1,11 +1,23 @@
-import { Issue, AgentType } from '../core/types.js';
+import { AgentType } from '../core/types.js';
+
+// Spawn arguments for safe execution (no shell)
+export interface SpawnArgs {
+  cmd: string;
+  args: string[];
+}
 
 // Adapter interface for different AI agents
 export interface AgentAdapter {
   type: AgentType;
 
-  // Build the shell command to run the agent
-  buildCommand(prompt: string, skipPermissions: boolean): string;
+  // Build argv array for initial prompt (no shell injection)
+  buildSpawnArgs(prompt: string, skipPermissions: boolean): SpawnArgs;
+
+  // Build argv array to continue/resume a session
+  buildContinueArgs(sessionId: string, prompt: string, skipPermissions: boolean): SpawnArgs;
+
+  // Extract session ID from agent output (returns null if not found)
+  extractSessionId(output: string): string | null;
 
   // Check if agent CLI is available
   isAvailable(): boolean;

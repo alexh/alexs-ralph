@@ -193,6 +193,7 @@ export function createLayout(screen: blessed.Widgets.Screen): LayoutWidgets {
     '{#ff4fd8-fg}[P]{/} Pause',
     '{#ff4fd8-fg}[S]{/} Stop',
     '{#ff4fd8-fg}[I]{/} Intervene',
+    '{#ff4fd8-fg}[T]{/} Refresh',
     '{#ff4fd8-fg}[Tab]{/} Switch',
     '{#ff4fd8-fg}[Q]{/} Quit',
   ];
