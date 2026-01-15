@@ -23,6 +23,7 @@ import {
   resumePausedLoop,
   stopLoop,
   retryLoop,
+  markLoopManualComplete,
   sendIntervention,
   loopEvents,
   appendLog,
@@ -826,10 +827,10 @@ function main(): void {
     const refresh = '{#ff4fd8-fg}[T]{/} Refresh';
     const viewLogs = '{#ff4fd8-fg}[L]{/} Logs';
     const toggleHidden = showHidden
-      ? '{#ffbe0b-fg}[h]{/} Show visible'
-      : '{#ffbe0b-fg}[h]{/} Show hidden';
+      ? '{#ffbe0b-fg}[H]{/} Show visible'
+      : '{#ffbe0b-fg}[H]{/} Show hidden';
     const bulkHide = '{#ff4fd8-fg}[B]{/} Bulk hide';
-    const hideAction = loop && !showHidden ? '{#ff4fd8-fg}[H]{/} Hide' : '';
+    const hideAction = loop && !showHidden ? '{#ff4fd8-fg}[h]{/} Hide' : '';
     const unhideAction = loop && showHidden ? '{#ff4fd8-fg}[U]{/} Unhide' : '';
     const visibilityActions = `${hideAction}${unhideAction ? ` ${unhideAction}` : ''} ${bulkHide} ${toggleHidden}`.trim();
 
@@ -845,8 +846,10 @@ function main(): void {
       actions = `${newLoop} ${refresh} ${viewLogs} {#ff4fd8-fg}[P]{/}${resumeLabel} {#ff4fd8-fg}[S]{/}top${discardAction} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'queued') {
       actions = `${newLoop} ${refresh} ${viewLogs} {#2de2e6-fg}Enter{/} Start {#ff4fd8-fg}[S]{/} Delete ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
-    } else if (loop.status === 'error' || loop.status === 'stopped') {
-      actions = `${newLoop} ${refresh} ${viewLogs} {#ffbe0b-fg}[R] RETRY{/} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+    } else if (loop.status === 'error') {
+      actions = `${newLoop} ${refresh} ${viewLogs} {#ffbe0b-fg}[R] RETRY{/} {#ffbe0b-fg}[M] Mark Complete{/} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+    } else if (loop.status === 'stopped') {
+      actions = `${newLoop} ${refresh} ${viewLogs} {#ffbe0b-fg}[R] RETRY{/} {#ffbe0b-fg}[M] Mark Complete{/} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'completed') {
       const closeIssueAction = loop.issueClosed ? '' : ` {#ff4fd8-fg}[C]{/}lose Issue`;
       actions = `${newLoop} ${refresh} ${viewLogs}${closeIssueAction} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
@@ -863,15 +866,25 @@ function main(): void {
   // ═══════════════════════════════════════════════════════════════════════════
   // LOOP SELECTION HANDLER
   // ═══════════════════════════════════════════════════════════════════════════
-  loopListWindow.on('select', (_item: any, index: number) => {
+  const handleLoopHighlight = (index: number): void => {
     const loop = loopListData[index];
-    if (loop) {
+    if (loop && loop.id !== selectedLoopId) {
       selectedLoopId = loop.id;
       updateDetailPane(loop);
       updateStatusBar(loop);
       loadLogsForLoop(loop.id);
       screen.render();
     }
+  };
+
+  // Update detail pane when navigating with arrow keys
+  loopListWindow.on('select item', (_item: any, index: number) => {
+    handleLoopHighlight(index);
+  });
+
+  // Also handle Enter key selection (same behavior now)
+  loopListWindow.on('select', (_item: any, index: number) => {
+    handleLoopHighlight(index);
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1398,6 +1411,14 @@ function main(): void {
       updateSkipPermBtn();
     });
 
+    // Enter to submit (when not focused on input)
+    modal.key(['enter'], () => {
+      if (screen.focused === input.box || screen.focused === repoInput.box || screen.focused === maxIterInput.box) {
+        return;
+      }
+      handleCreate();
+    });
+
     screen.render();
   });
 
@@ -1406,48 +1427,81 @@ function main(): void {
   // ═══════════════════════════════════════════════════════════════════════════
 
   const confirmHideLoop = (loop: Loop, onConfirm: () => void): void => {
+    const isRunning = loop.status === 'running';
     const confirm = blessed.box({
       parent: screen,
-      label: ' {bold}{#ff4fd8-fg}◆ CONFIRM HIDE{/} ',
+      label: isRunning
+        ? ' {bold}{#ff006e-fg}⚠ WARNING{/} '
+        : ' {bold}{#ff4fd8-fg}◆ CONFIRM HIDE{/} ',
       tags: true,
       top: 'center',
       left: 'center',
       width: 54,
-      height: 7,
+      height: isRunning ? 11 : 7,
       border: 'line',
-      style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
+      style: {
+        fg: 'white',
+        bg: isRunning ? 'red' : 'blue',
+        transparent: true,
+        border: { fg: isRunning ? '#ff006e' : 'magenta' },
+      },
       shadow: true,
     } as any);
 
-    blessed.text({
-      parent: confirm,
-      top: 1,
-      left: 2,
-      tags: true,
-      content: `{#eaeaea-fg}Hide ${loop.status} loop #${loop.issue.number}?{/}`,
-    });
+    if (isRunning) {
+      blessed.text({
+        parent: confirm,
+        top: 1,
+        left: 'center',
+        tags: true,
+        content: '{bold}{#ffffff-fg}⚠  LOOP IS RUNNING  ⚠{/}',
+      });
+      blessed.text({
+        parent: confirm,
+        top: 3,
+        left: 2,
+        tags: true,
+        content: `{#ffffff-fg}Hiding loop #${loop.issue.number} will NOT stop it.{/}`,
+      });
+      blessed.text({
+        parent: confirm,
+        top: 4,
+        left: 2,
+        tags: true,
+        content: '{#ffffff-fg}It will continue running in the background!{/}',
+      });
+    } else {
+      blessed.text({
+        parent: confirm,
+        top: 1,
+        left: 2,
+        tags: true,
+        content: `{#eaeaea-fg}Hide ${loop.status} loop #${loop.issue.number}?{/}`,
+      });
+    }
 
+    const btnTop = isRunning ? 7 : 3;
     const yesBtn = blessed.button({
       parent: confirm,
-      top: 3,
+      top: btnTop,
       left: 2,
-      width: 10,
+      width: 16,
       height: 1,
-      content: 'Yes',
+      content: isRunning ? 'Hide Anyway' : 'Yes',
       align: 'center',
-      style: { fg: 'black', bg: 'magenta', bold: true, hover: { bg: 'cyan' } },
+      style: { fg: 'black', bg: isRunning ? '#ff006e' : 'magenta', bold: true, hover: { bg: 'cyan' } },
       mouse: true,
     } as any);
 
     const noBtn = blessed.button({
       parent: confirm,
-      top: 3,
-      left: 14,
+      top: btnTop,
+      left: 20,
       width: 10,
       height: 1,
-      content: 'No',
+      content: 'Cancel',
       align: 'center',
-      style: { fg: 'white', bg: 240, hover: { bg: 'red' } },
+      style: { fg: 'white', bg: 240, hover: { bg: 'green' } },
       mouse: true,
     } as any);
 
@@ -1576,6 +1630,8 @@ function main(): void {
 
     hideBtn.on('press', applyBulkHide);
     cancelBtn.on('press', closeModal);
+    daysInput.key(['enter'], applyBulkHide);
+    daysInput.key(['escape'], closeModal);
     modal.key(['escape', 'S-tab'], closeModal);
     modal.key(['enter'], applyBulkHide);
     modal.key(['tab'], () => inputManager.activate(daysInput));
@@ -1583,16 +1639,10 @@ function main(): void {
     screen.render();
   };
 
-  // h - Toggle hidden list
+  // h - Hide selected loop
   screen.key(['h'], () => {
     if (isAnyInputActive()) return;
-    showHidden = !showHidden;
-    refreshAfterVisibilityChange();
-  });
-
-  // H - Hide selected loop
-  screen.key(['H'], () => {
-    if (isAnyInputActive()) return;
+    if (showHidden) return; // Don't hide when viewing hidden list
     if (!selectedLoopId) return;
     const loop = state.loops.find(l => l.id === selectedLoopId);
     if (!loop) return;
@@ -1617,6 +1667,13 @@ function main(): void {
     }
 
     hideLoop();
+  });
+
+  // Shift+H - Toggle hidden list view
+  screen.key(['H', 'S-h'], () => {
+    if (isAnyInputActive()) return;
+    showHidden = !showHidden;
+    refreshAfterVisibilityChange();
   });
 
   // U - Unhide selected loop (when viewing hidden list)
@@ -1819,6 +1876,126 @@ function main(): void {
     }
   });
 
+  // M - Mark errored/stopped loop as completed (with confirmation)
+  screen.key(['m', 'M'], () => {
+    if (isAnyInputActive()) return;
+    if (!selectedLoopId) return;
+    const loop = state.loops.find(l => l.id === selectedLoopId);
+    if (!loop) return;
+
+    if (loop.status !== 'error' && loop.status !== 'stopped') {
+      logWithGlow('{#ff006e-fg}[error]{/} Can only mark ERROR or STOPPED loops as complete', 'error');
+      screen.render();
+      return;
+    }
+
+    const modal = blessed.box({
+      parent: screen,
+      label: ' {bold}{#ff4fd8-fg}◆ MARK COMPLETE{/} ',
+      tags: true,
+      top: 'center',
+      left: 'center',
+      width: 70,
+      height: 12,
+      border: 'line',
+      style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
+      shadow: true,
+    } as any);
+
+    blessed.text({
+      parent: modal,
+      top: 1,
+      left: 2,
+      tags: true,
+      content: `{#eaeaea-fg}Mark loop #${loop.issue.number} as completed?{/}`,
+    });
+
+    blessed.text({
+      parent: modal,
+      top: 3,
+      left: 2,
+      tags: true,
+      content: '{#eaeaea-fg}Optional completion note:{/}',
+    });
+
+    const noteInput = createCursorInput({
+      parent: modal,
+      top: 5,
+      left: 2,
+      width: 64,
+      height: 3,
+      style: { fg: 'white', bg: 'black', border: { fg: 'cyan' }, focus: { border: { fg: 'magenta' } } },
+    }, screen);
+
+    const inputManager = createInputManager<ManagedInput>({
+      onActivate: () => screen.render(),
+    });
+
+    noteInput.on('click', () => inputManager.activate(noteInput));
+    setTimeout(() => inputManager.activate(noteInput), 50);
+
+    const closeModal = (): void => {
+      modal.destroy();
+      loopListWindow.focus();
+      screen.render();
+    };
+
+    const handleConfirm = (): void => {
+      const note = noteInput.getValue().trim();
+      try {
+        markLoopManualComplete(loop.id, note);
+        state = loadState();
+        const updatedLoop = state.loops.find(l => l.id === loop.id);
+        updateLoopList();
+        updateHeader();
+        updateTabBar();
+        const selectionChanged = syncSelectionAfterFilter();
+        if (!selectionChanged && updatedLoop) {
+          updateDetailPane(updatedLoop);
+          updateStatusBar(updatedLoop);
+        }
+        loadLogsForLoop(loop.id);
+        logWithGlow('{#00f5d4-fg}[system]{/} Loop marked complete', 'system');
+      } catch (err: any) {
+        logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+      }
+      closeModal();
+    };
+
+    const confirmBtn = blessed.button({
+      parent: modal,
+      top: 9,
+      left: 2,
+      width: 16,
+      height: 1,
+      content: 'Mark Complete',
+      align: 'center',
+      style: { fg: 'black', bg: 'magenta', bold: true, hover: { bg: 'cyan' } },
+      mouse: true,
+    } as any);
+
+    const cancelBtn = blessed.button({
+      parent: modal,
+      top: 9,
+      left: 20,
+      width: 12,
+      height: 1,
+      content: 'Cancel',
+      align: 'center',
+      style: { fg: 'white', bg: 240, hover: { bg: 'red' } },
+      mouse: true,
+    } as any);
+
+    confirmBtn.on('press', handleConfirm);
+    cancelBtn.on('press', closeModal);
+    noteInput.key(['enter'], handleConfirm);
+    noteInput.key(['escape'], closeModal);
+    modal.key(['y', 'Y', 'enter'], handleConfirm);
+    modal.key(['n', 'N', 'escape', 'S-tab'], closeModal);
+
+    screen.render();
+  });
+
   // C - Close issue for completed loop (with confirmation)
   screen.key(['c', 'C'], () => {
     if (isAnyInputActive()) return;
@@ -2011,6 +2188,8 @@ function main(): void {
 
     closeBtn.on('press', proceedToConfirm);
     cancelBtn.on('press', closeModal);
+    commentInput.key(['enter'], proceedToConfirm);
+    commentInput.key(['escape'], closeModal);
     modal.key(['escape', 'S-tab'], closeModal);
     modal.key(['y', 'Y', 'enter'], proceedToConfirm);
 

@@ -343,12 +343,9 @@ async function runIterationLoop(
       type: 'system',
       content: `--- Iteration ${iterState.iteration}/${iterState.maxIterations} ---`,
     });
-
-    // Update loop iteration count
-    state = loadState();
-    state = updateLoop(state, loopId, { iteration: iterState.iteration });
-    saveState(state);
     emit({ type: 'iteration', loopId, iteration: iterState.iteration });
+    // NOTE: iteration count is saved AFTER criteria processing to avoid race condition
+    // where this save could overwrite concurrent criterion updates from the previous iteration
 
     // Build spawn args - use continue if we have a session ID
     let spawnArgs: SpawnArgs;
@@ -395,6 +392,10 @@ async function runIterationLoop(
       // Reset circuit breaker to avoid false triggers from truncated output
       iterState.circuitBreaker = createCircuitBreaker();
       currentPrompt = `OPERATOR INTERVENTION:\n${intervention}\n\nPlease acknowledge this message and adjust your approach accordingly. Continue working on the task.`;
+      // Save iteration count before continuing
+      state = loadState();
+      state = updateLoop(state, loopId, { iteration: iterState.iteration });
+      saveState(state);
       continue;
     }
 
@@ -459,6 +460,10 @@ async function runIterationLoop(
       currentPrompt = `You output <promise>TASK COMPLETE</promise>, but the following criteria remain:\n` +
         remaining.map(item => `- ${item}`).join('\n') +
         `\n\nComplete them and emit <criterion-complete>N</criterion-complete> for each, then output <promise>TASK COMPLETE</promise> again.`;
+      // Save iteration count before continuing (after criteria have been processed)
+      state = loadState();
+      state = updateLoop(state, loopId, { iteration: iterState.iteration });
+      saveState(state);
       continue;
     }
 
@@ -473,6 +478,11 @@ async function runIterationLoop(
     } else {
       currentPrompt = 'Continue working on the task. What is the next step?';
     }
+
+    // Save iteration count at end of iteration (after criteria have been processed)
+    state = loadState();
+    state = updateLoop(state, loopId, { iteration: iterState.iteration });
+    saveState(state);
   }
 
   // Check if hit max iterations
@@ -782,7 +792,7 @@ export async function resumePausedLoop(loopId: string): Promise<void> {
   }
 }
 
-// Stop a loop (SIGTERM)
+// Stop a loop (SIGKILL to ensure termination)
 export function stopLoop(loopId: string): void {
   const proc = processes.get(loopId);
   if (!proc || !proc.pid) {
@@ -798,7 +808,17 @@ export function stopLoop(loopId: string): void {
     return;
   }
 
-  process.kill(proc.pid, 'SIGTERM');
+  // Try to kill the process group first (negative PID), then the process itself
+  try {
+    process.kill(-proc.pid, 'SIGKILL');
+  } catch {
+    // Process group kill failed, try direct kill
+    try {
+      process.kill(proc.pid, 'SIGKILL');
+    } catch {
+      // Process already dead
+    }
+  }
 
   let state = loadState();
   state = updateLoop(state, loopId, {
@@ -844,6 +864,36 @@ export async function retryLoop(loopId: string): Promise<void> {
 
   // Start the loop again
   await startLoop(loopId);
+}
+
+// Manually mark an errored or stopped loop as completed
+export function markLoopManualComplete(loopId: string, note?: string): void {
+  let state = loadState();
+  const loop = state.loops.find(l => l.id === loopId);
+
+  if (!loop) {
+    throw new Error(`Loop not found: ${loopId}`);
+  }
+
+  if (loop.status !== 'error' && loop.status !== 'stopped') {
+    throw new Error(`Loop cannot be marked complete (status: ${loop.status})`);
+  }
+
+  state = updateLoop(state, loopId, {
+    status: 'completed',
+    error: undefined,
+    exitReason: 'manual_complete',
+    endedAt: new Date().toISOString(),
+  });
+  saveState(state);
+
+  const trimmedNote = note?.trim() ?? '';
+  const noteText = trimmedNote ? trimmedNote : 'none';
+  appendLog(loopId, {
+    type: 'system',
+    content: `Manually marked complete by operator: ${noteText}`,
+  });
+  emit({ type: 'completed', loopId });
 }
 
 // Send intervention - interrupts current process and resumes with message

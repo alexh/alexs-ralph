@@ -111,6 +111,7 @@ export type ExitReason =
   | 'circuit_breaker'        // circuit breaker opened
   | 'max_iterations'         // hit iteration limit
   | 'user_stopped'           // manual stop
+  | 'manual_complete'        // manual override to completed
   | 'error';                 // unrecoverable error
 
 // Loop iteration state
