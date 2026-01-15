@@ -1,0 +1,44 @@
+name: gemini
+displayName: Gemini
+
+command: gemini
+
+availability:
+  check: which
+
+spawn:
+  args:
+    - "-p"
+    - "{{prompt}}"
+    - "{{#skipPermissions}}--yolo{{/skipPermissions}}"
+
+continue:
+  args:
+    - "--resume"
+    - "{{sessionId}}"
+    - "-p"
+    - "{{prompt}}"
+    - "{{#skipPermissions}}--yolo{{/skipPermissions}}"
+
+sessionExtraction:
+  patterns:
+    - '"sessionId"\\s*:\\s*"([^"]+)"'
+    - '"session_id"\\s*:\\s*"([^"]+)"'
+    - 'Session:\\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+
+resumePrompt: |
+  RESUMING FROM PAUSE (previous session)
+
+  ## Summary of work done so far:
+  {{workSummary}}
+
+  ## Remaining acceptance criteria:
+  {{#remainingCriteria}}
+  - {{.}}
+  {{/remainingCriteria}}
+
+  Please continue working on this task. Review the summary above and pick up where you left off. When each criterion is complete, emit <criterion-complete>N</criterion-complete>. When all criteria are done, emit <promise>TASK COMPLETE</promise>.
+
+meta:
+  version: "1.0"
+  description: Google Gemini CLI adapter

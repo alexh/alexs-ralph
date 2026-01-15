@@ -1,11 +1,16 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { parse as parseYaml } from 'yaml';
 import { AdapterConfig } from './schema.js';
 import { AgentAdapter } from './base.js';
 import { createCustomAdapter } from './factory.js';
 
-// Config directory paths
+// Get directory of this module for bundled adapters
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// Config directory paths (priority: bundled < global < local)
+const BUNDLED_ADAPTERS_DIR = path.join(__dirname, 'builtin');
 const GLOBAL_ADAPTERS_DIR = path.join(process.env.HOME || '~', '.alex', 'adapters');
 const LOCAL_ADAPTERS_DIR = path.join(process.cwd(), '.alex', 'adapters');
 
@@ -20,21 +25,39 @@ export interface LoadResult {
 }
 
 /**
- * Get the paths to adapter config directories.
+ * Get the paths to adapter config directories (for watching).
+ * Note: bundled adapters are not watched since they're part of the package.
  */
 export function getConfigPaths(): string[] {
   return [GLOBAL_ADAPTERS_DIR, LOCAL_ADAPTERS_DIR];
 }
 
 /**
- * Load all custom adapter configs from global and local directories.
- * Local configs override global configs with the same name.
+ * Get path to bundled adapters directory.
+ */
+export function getBundledPath(): string {
+  return BUNDLED_ADAPTERS_DIR;
+}
+
+/**
+ * Load all adapter configs from bundled, global, and local directories.
+ * Priority: bundled < global < local (later overrides earlier).
  */
 export function loadCustomAdapters(): LoadResult {
   const adapters = new Map<string, AgentAdapter>();
   const errors: LoadError[] = [];
 
-  // Load global configs first
+  // Load bundled adapters first (lowest priority, can be overridden)
+  const bundledConfigs = loadFromDirectory(BUNDLED_ADAPTERS_DIR, errors);
+  for (const [name, config] of bundledConfigs) {
+    try {
+      adapters.set(name, createCustomAdapter(config));
+    } catch (err) {
+      errors.push({ file: `${BUNDLED_ADAPTERS_DIR}/${name}`, error: String(err) });
+    }
+  }
+
+  // Load global configs (override bundled)
   const globalConfigs = loadFromDirectory(GLOBAL_ADAPTERS_DIR, errors);
   for (const [name, config] of globalConfigs) {
     try {

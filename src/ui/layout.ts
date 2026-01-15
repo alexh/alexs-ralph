@@ -57,7 +57,7 @@ export function createLayout(screen: blessed.Widgets.Screen): LayoutWidgets {
     top: 6,
     left: 0,
     width: '35%',
-    height: '100%-9',
+    height: '100%-8',
     keys: true,
     mouse: true,
     vi: true,
@@ -88,7 +88,7 @@ export function createLayout(screen: blessed.Widgets.Screen): LayoutWidgets {
     top: 6,
     left: '35%',
     width: '65%',
-    height: '100%-9',
+    height: '100%-8',
     border: 'line',
     style: {
       fg: 'white',
@@ -176,7 +176,7 @@ export function createLayout(screen: blessed.Widgets.Screen): LayoutWidgets {
     bottom: 0,
     left: 0,
     width: '100%',
-    height: 3,
+    height: 2,
     tags: true,
     style: {
       fg: 'white',
@@ -184,7 +184,6 @@ export function createLayout(screen: blessed.Widgets.Screen): LayoutWidgets {
     },
     padding: {
       left: 1,
-      top: 1,
     },
   } as any);
 

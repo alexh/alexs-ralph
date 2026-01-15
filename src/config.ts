@@ -1,9 +1,55 @@
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
+import { parse as parseYaml } from 'yaml';
 
-// Paths
-export const DATA_DIR = path.join(process.cwd(), 'data');
+// User config path
+export const ALEX_DIR = path.join(os.homedir(), '.alex');
+export const ALEX_CONFIG_FILE = path.join(ALEX_DIR, 'config.yaml');
+export const ALEX_WORKTREES_DIR = path.join(ALEX_DIR, 'worktrees');
+
+// Data paths (stored in user home dir)
+export const DATA_DIR = path.join(ALEX_DIR, 'data');
 export const LOOPS_DIR = path.join(DATA_DIR, 'loops');
 export const STATE_FILE = path.join(DATA_DIR, 'state.json');
+
+// User config schema
+interface UserConfig {
+  worktrees?: {
+    enabled?: boolean;
+    baseDir?: string;
+  };
+  loops?: {
+    maxIterations?: number;
+    iterationTimeoutMs?: number;
+    autoCompleteOnCriteria?: boolean;
+  };
+  stuckDetection?: {
+    enabled?: boolean;
+    thresholdMinutes?: number;
+  };
+  ui?: {
+    showHidden?: boolean;
+    logTailLines?: number;
+    scrollingText?: boolean;
+  };
+}
+
+// Load user config from ~/.alex/config.yaml
+function loadUserConfig(): UserConfig {
+  try {
+    if (fs.existsSync(ALEX_CONFIG_FILE)) {
+      const content = fs.readFileSync(ALEX_CONFIG_FILE, 'utf-8');
+      return parseYaml(content) as UserConfig || {};
+    }
+  } catch (err) {
+    console.error(`Warning: Failed to load ${ALEX_CONFIG_FILE}:`, err);
+  }
+  return {};
+}
+
+// Load user config once at startup
+const userConfig = loadUserConfig();
 
 // Theme colors (Cyberpunk/Vaporwave)
 export const colors = {
@@ -39,10 +85,13 @@ export const AGENT_COMMANDS = {
 // Tab names
 export const TABS = ['All', 'Running', 'Paused', 'Completed', 'Errors'] as const;
 
-// Loop settings
-export const MAX_ITERATIONS_DEFAULT = 20;
-export const STUCK_TIMEOUT_MINUTES = 5;
-export const AUTO_COMPLETE_ON_CRITERIA = true;
+// Loop settings (with user config overrides)
+export const MAX_ITERATIONS_DEFAULT = userConfig.loops?.maxIterations ?? 20;
+export const STUCK_TIMEOUT_MINUTES = userConfig.stuckDetection?.thresholdMinutes ?? 5;
+export const AUTO_COMPLETE_ON_CRITERIA = userConfig.loops?.autoCompleteOnCriteria ?? true;
+export const WORKTREES_ENABLED = userConfig.worktrees?.enabled ?? true;
+export const STUCK_DETECTION_ENABLED = userConfig.stuckDetection?.enabled ?? true;
+export const SCROLLING_TEXT_ENABLED = userConfig.ui?.scrollingText ?? false;
 
 // Circuit breaker thresholds
 export const CB_NO_PROGRESS_THRESHOLD = 3;        // Open after N loops with no file changes
@@ -100,3 +149,8 @@ export const NO_WORK_PATTERNS = [
   /already implemented/i,
   /up to date/i,
 ];
+
+// Metrics dashboard settings
+export const METRICS_TREND_DAYS = 14;
+export const METRICS_TREND_WEEKS = 8;
+export const METRICS_TOP_FAILURES = 5;

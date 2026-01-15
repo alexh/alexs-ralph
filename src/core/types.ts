@@ -44,6 +44,14 @@ export interface Loop {
   pausedSessionId?: string;   // Claude session ID at time of pause
   pausedAt?: string;          // ISO timestamp when paused
   pausedFromPreviousSession?: boolean; // True if paused in a previous TUI session
+  // Worktree isolation fields
+  worktreePath?: string;      // wt-managed worktree path
+  worktreeBranch?: string;    // branch name (alex-{loopId})
+  startCommit?: string;       // git SHA at loop start (for deterministic diff)
+  // Cross-agent review fields
+  reviewLoopId?: string;      // links to review loop
+  parentLoopId?: string;      // review loop → original loop link
+  isReviewLoop?: boolean;     // flag for review loops
 }
 
 // Log entry for JSONL
@@ -54,10 +62,18 @@ export interface LogEntry {
   content: string;
 }
 
+// App settings
+export interface AppSettings {
+  autoRequestReview?: boolean;    // auto-trigger review on loop completion
+  worktreeBaseDir?: string;       // default: sibling dir to project
+  defaultReviewerAgent?: string;  // preferred reviewer agent type
+}
+
 // App state persisted to disk
 export interface AppState {
   loops: Loop[];
   activeLoopId?: string;
+  settings?: AppSettings;
 }
 
 // Event types for loop manager

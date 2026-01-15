@@ -14,9 +14,15 @@ import {
   ExitReason,
   AcceptanceCriterion,
 } from './types.js';
-import { getAdapter, SpawnArgs } from '../adapters/index.js';
+import { getAdapter, getAvailableAdapters, SpawnArgs } from '../adapters/index.js';
 import { appendLog, generateResumeSummary } from './logs.js';
 import { buildPromptFromIssue } from './issues.js';
+import {
+  createWorktree,
+  getHeadCommit,
+  isWorktreeAvailable,
+} from './worktree.js';
+import { generateReviewContext } from './review.js';
 import {
   COMPLETION_PROMISE,
   MAX_ITERATIONS_DEFAULT,
@@ -138,15 +144,39 @@ function getIncompleteCriteria(criteria: AcceptanceCriterion[]): string[] {
 }
 
 // Create a new loop from an issue
-export function createLoop(
+export async function createLoop(
   issue: Issue,
   agent: AgentType,
   skipPermissions: boolean,
   workingDir: string,
-  maxIterations: number = MAX_ITERATIONS_DEFAULT
-): Loop {
+  maxIterations: number = MAX_ITERATIONS_DEFAULT,
+  options?: {
+    parentLoopId?: string;
+    isReviewLoop?: boolean;
+    useWorktree?: boolean;
+  }
+): Promise<Loop> {
   const id = generateLoopId();
   ensureLoopDir(id);
+
+  let worktreePath: string | undefined;
+  let worktreeBranch: string | undefined;
+
+  // Create worktree if available and requested (default: true for non-review loops)
+  const shouldUseWorktree = options?.useWorktree ?? !options?.isReviewLoop;
+  if (shouldUseWorktree && isWorktreeAvailable()) {
+    try {
+      const wt = await createWorktree(id);
+      worktreePath = wt.worktreePath;
+      worktreeBranch = wt.worktreeBranch;
+    } catch (err) {
+      // Log warning but continue without worktree
+      appendLog(id, {
+        type: 'system',
+        content: `Warning: Failed to create worktree: ${err}. Using main directory.`,
+      });
+    }
+  }
 
   const loop: Loop = {
     id,
@@ -155,9 +185,13 @@ export function createLoop(
     status: 'queued',
     skipPermissions,
     hidden: false,
-    workingDir,
+    workingDir: worktreePath || workingDir,
+    worktreePath,
+    worktreeBranch,
     iteration: 0,
     maxIterations,
+    parentLoopId: options?.parentLoopId,
+    isReviewLoop: options?.isReviewLoop,
   };
 
   // Save to state
@@ -166,6 +200,12 @@ export function createLoop(
   saveState(state);
 
   appendLog(id, { type: 'system', content: `Loop created for issue: ${issue.title}` });
+  if (worktreePath) {
+    appendLog(id, { type: 'system', content: `Worktree: ${worktreeBranch} at ${worktreePath}` });
+  }
+  if (options?.isReviewLoop && options?.parentLoopId) {
+    appendLog(id, { type: 'system', content: `Review loop for: ${options.parentLoopId}` });
+  }
 
   return loop;
 }
@@ -248,6 +288,9 @@ export async function startLoop(loopId: string): Promise<void> {
   // Capture git baseline for progress detection
   const gitBaseline = captureGitBaseline(loop.workingDir);
 
+  // Capture start commit for deterministic diffs (used in reviews)
+  const startCommit = getHeadCommit(loop.workingDir) || undefined;
+
   // Initialize iteration state
   const iterState: LoopIterationState = {
     iteration: 0,
@@ -269,11 +312,15 @@ export async function startLoop(loopId: string): Promise<void> {
   if (gitBaseline) {
     appendLog(loopId, { type: 'system', content: `Git baseline captured: ${gitBaseline.initialDirtyFiles.size} dirty files tracked` });
   }
+  if (startCommit) {
+    appendLog(loopId, { type: 'system', content: `Start commit: ${startCommit.substring(0, 8)}` });
+  }
 
   // Update state to running
   state = updateLoop(state, loopId, {
     status: 'running',
     startedAt: new Date().toISOString(),
+    startCommit,
     iteration: 0,
     maxIterations: loop.maxIterations ?? MAX_ITERATIONS_DEFAULT,
   });
@@ -624,6 +671,7 @@ async function runSingleIteration(
  */
 function finalizeLoop(loopId: string, iterState: LoopIterationState): void {
   let state = loadState();
+  const loop = state.loops.find(l => l.id === loopId);
 
   const exitReason = iterState.exitReason || 'error';
   const status: LoopStatus = exitReason === 'user_stopped' ? 'stopped'
@@ -649,6 +697,18 @@ function finalizeLoop(loopId: string, iterState: LoopIterationState): void {
 
   if (status === 'completed') {
     emit({ type: 'completed', loopId });
+
+    // Check for auto-review (async, fire-and-forget)
+    if (loop && !loop.isReviewLoop && state.settings?.autoRequestReview) {
+      const alternateAgent = getAlternateAgent(loop.agent);
+      if (alternateAgent) {
+        appendLog(loopId, { type: 'system', content: 'Auto-requesting review...' });
+        // Fire and forget - don't block finalization
+        createReviewLoop(loopId, alternateAgent).catch(err => {
+          appendLog(loopId, { type: 'error', content: `Auto-review failed: ${err}` });
+        });
+      }
+    }
   } else if (status === 'error') {
     emit({ type: 'error', loopId, error: exitReason });
   } else {
@@ -1029,4 +1089,152 @@ export function discardPausedLoop(loopId: string): void {
  */
 export function canResumeInSession(loopId: string): boolean {
   return processes.has(loopId);
+}
+
+/**
+ * Create a review loop for a completed loop.
+ * The reviewer agent analyzes the original loop's work.
+ */
+export async function createReviewLoop(
+  originalLoopId: string,
+  reviewerAgentType?: AgentType
+): Promise<Loop> {
+  let state = loadState();
+  const originalLoop = state.loops.find(l => l.id === originalLoopId);
+
+  if (!originalLoop) {
+    throw new Error(`Original loop not found: ${originalLoopId}`);
+  }
+
+  if (originalLoop.status !== 'completed') {
+    throw new Error(`Can only review completed loops (status: ${originalLoop.status})`);
+  }
+
+  if (originalLoop.reviewLoopId) {
+    throw new Error(`Loop already has a review: ${originalLoop.reviewLoopId}`);
+  }
+
+  // Select reviewer agent - must be different from original
+  let reviewerAgent = reviewerAgentType;
+  if (!reviewerAgent) {
+    const availableAdapters = getAvailableAdapters();
+    const differentAgent = availableAdapters.find(a => a.type !== originalLoop.agent);
+    if (!differentAgent) {
+      throw new Error('No different agent available for review');
+    }
+    reviewerAgent = differentAgent.type;
+  }
+
+  if (reviewerAgent === originalLoop.agent) {
+    throw new Error('Reviewer agent must be different from original agent');
+  }
+
+  // Generate review context
+  const { prompt } = generateReviewContext(originalLoop);
+
+  // Create the review issue (copy of original with review task)
+  const reviewIssue: Issue = {
+    ...originalLoop.issue,
+    title: `[Review] ${originalLoop.issue.title}`,
+    body: prompt,
+    acceptanceCriteria: [
+      { text: 'Review correctness against acceptance criteria', completed: false },
+      { text: 'Check code quality and maintainability', completed: false },
+      { text: 'Identify any issues or improvements', completed: false },
+      { text: 'Provide actionable feedback', completed: false },
+    ],
+  };
+
+  // Create review loop in the SAME worktree as original (sees exact state)
+  const reviewLoop = await createLoop(
+    reviewIssue,
+    reviewerAgent,
+    originalLoop.skipPermissions,
+    originalLoop.worktreePath || originalLoop.workingDir,
+    10, // Review loops get fewer iterations
+    {
+      parentLoopId: originalLoopId,
+      isReviewLoop: true,
+      useWorktree: false, // Use original's worktree
+    }
+  );
+
+  // Link review to original loop
+  state = loadState();
+  state = updateLoop(state, originalLoopId, { reviewLoopId: reviewLoop.id });
+  saveState(state);
+
+  appendLog(originalLoopId, {
+    type: 'system',
+    content: `Review loop created: ${reviewLoop.id} (reviewer: ${reviewerAgent})`,
+  });
+
+  return reviewLoop;
+}
+
+/**
+ * Create a follow-up loop from review feedback.
+ * Continues the original loop's session with review context.
+ */
+export async function createFollowUpFromReview(
+  reviewLoopId: string
+): Promise<Loop> {
+  let state = loadState();
+  const reviewLoop = state.loops.find(l => l.id === reviewLoopId);
+
+  if (!reviewLoop || !reviewLoop.isReviewLoop || !reviewLoop.parentLoopId) {
+    throw new Error('Not a review loop or missing parent');
+  }
+
+  const originalLoop = state.loops.find(l => l.id === reviewLoop.parentLoopId);
+  if (!originalLoop) {
+    throw new Error(`Parent loop not found: ${reviewLoop.parentLoopId}`);
+  }
+
+  // Get review summary for follow-up prompt
+  const reviewSummary = generateResumeSummary(reviewLoopId, 2000);
+
+  // Create follow-up issue
+  const followUpIssue: Issue = {
+    ...originalLoop.issue,
+    title: `[Follow-up] ${originalLoop.issue.title}`,
+    body: `${originalLoop.issue.body}\n\n## Review Feedback\n\n${reviewSummary}`,
+    // Keep original acceptance criteria
+    acceptanceCriteria: originalLoop.issue.acceptanceCriteria.map(c => ({
+      ...c,
+      completed: false, // Reset for re-verification
+      completedBy: undefined,
+      completedAt: undefined,
+    })),
+  };
+
+  // Create follow-up loop in same worktree
+  const followUpLoop = await createLoop(
+    followUpIssue,
+    originalLoop.agent,
+    originalLoop.skipPermissions,
+    originalLoop.worktreePath || originalLoop.workingDir,
+    originalLoop.maxIterations,
+    {
+      parentLoopId: originalLoop.id,
+      useWorktree: false, // Continue in original's worktree
+    }
+  );
+
+  appendLog(originalLoop.id, {
+    type: 'system',
+    content: `Follow-up loop created from review: ${followUpLoop.id}`,
+  });
+
+  return followUpLoop;
+}
+
+/**
+ * Get the first available agent that is different from the specified agent.
+ * Used for auto-review agent selection.
+ */
+export function getAlternateAgent(excludeAgent: AgentType): AgentType | null {
+  const availableAdapters = getAvailableAdapters();
+  const alternate = availableAdapters.find(a => a.type !== excludeAgent);
+  return alternate?.type || null;
 }

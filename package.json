@@ -8,8 +8,8 @@
     "alex": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
-    "start": "tsc && bun dist/index.js",
+    "build": "tsc && cp -r src/adapters/builtin dist/adapters/ && cp -r src/animations dist/",
+    "start": "bun run build && bun dist/index.js",
     "dev": "tsc --watch",
     "test": "bun test",
     "clean": "rm -rf dist",

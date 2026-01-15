@@ -2,13 +2,17 @@
 import fs from 'fs';
 import path from 'path';
 import blessed from 'blessed';
+import { parseArgs, runConfigure, runClean, showHelp, shouldShowTutorial } from './cli.js';
+import { runTutorial } from './tutorial.js';
+import { runUninstallWizard } from './uninstall.js';
 import { createScreen } from './ui/screen.js';
-import { colors, MAX_ITERATIONS_DEFAULT } from './config.js';
+import { colors, MAX_ITERATIONS_DEFAULT, METRICS_TREND_DAYS, METRICS_TREND_WEEKS, METRICS_TOP_FAILURES, DATA_DIR, SCROLLING_TEXT_ENABLED } from './config.js';
 import { statusColors, statusIcons } from './ui/theme.js';
 import {
   Issue,
   Loop,
   LoopStatus,
+  AppSettings,
   loadState,
   saveState,
   updateLoop,
@@ -36,10 +40,18 @@ import {
   markOrphanedPausedLoops,
   discardPausedLoop,
   canResumeInSession,
+  createReviewLoop,
+  createFollowUpFromReview,
+  getAlternateAgent,
+  calculateMetrics,
+  formatDuration as formatDurationMs,
+  exportMetricsToJson,
+  DashboardMetrics,
 } from './core/index.js';
 import { getAvailableAdapters, adapterEvents, AgentAdapter } from './adapters/index.js';
 import { createInputManager, ManagedInput } from './ui/input-manager.js';
 import { createCursorInput, isAnyInputActive } from './ui/cursor-input.js';
+import { renderHorizontalBar, renderVerticalBars, renderHeatmap } from './ui/charts.js';
 
 function main(): void {
   const screen = createScreen();
@@ -168,10 +180,16 @@ function main(): void {
     screen.render();
   }, 120);
 
+  const isHiddenLoop = (loop: Loop): boolean => loop.hidden === true;
+
+  function getVisibleLoops(): Loop[] {
+    return showHidden ? state.loops.filter(isHiddenLoop) : state.loops.filter(loop => !isHiddenLoop(loop));
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
-  // HEADER BAR
+  // UNIFIED TAB BAR (ALEX | X running | X paused | X done | X error)
   // ═══════════════════════════════════════════════════════════════════════════
-  const headerBox = blessed.box({
+  const tabBar = blessed.box({
     parent: screen,
     top: 0,
     left: 0,
@@ -181,49 +199,12 @@ function main(): void {
     style: { fg: 'white', bg: 'black', transparent: true },
   } as any);
 
-  const isHiddenLoop = (loop: Loop): boolean => loop.hidden === true;
-
-  function getVisibleLoops(): Loop[] {
-    return showHidden ? state.loops.filter(isHiddenLoop) : state.loops.filter(loop => !isHiddenLoop(loop));
-  }
-
-  function updateHeader(): void {
-    const visibleLoops = getVisibleLoops();
-    const counts = {
-      running: visibleLoops.filter(l => l.status === 'running').length,
-      paused: visibleLoops.filter(l => l.status === 'paused').length,
-      completed: visibleLoops.filter(l => l.status === 'completed').length,
-      error: visibleLoops.filter(l => l.status === 'error').length,
-    };
-    headerBox.setContent(
-      ` {bold}{#ff4fd8-fg}◆ ALEX{/}{/bold} {#666-fg}│{/} ` +
-      `{#2de2e6-fg}${counts.running}{/} running {#666-fg}│{/} ` +
-      `{#ffbe0b-fg}${counts.paused}{/} paused {#666-fg}│{/} ` +
-      `{#00f5d4-fg}${counts.completed}{/} done {#666-fg}│{/} ` +
-      `{#ff006e-fg}${counts.error}{/} errors`
-    );
-  }
-  updateHeader();
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // TAB BAR
-  // ═══════════════════════════════════════════════════════════════════════════
-  const tabBar = blessed.box({
-    parent: screen,
-    top: 1,
-    left: 0,
-    width: '100%',
-    height: 1,
-    tags: true,
-    style: { fg: 'white', bg: 'black', transparent: true },
-  } as any);
-
   const tabDefs = [
-    { label: 'All', status: null },
-    { label: 'Running', status: 'running' },
-    { label: 'Paused', status: 'paused' },
-    { label: 'Completed', status: 'completed' },
-    { label: 'Errors', status: 'error' },
+    { label: 'ALEx', status: null, color: '#ff4fd8', icon: '◆' },
+    { label: 'running', status: 'running', color: '#2de2e6', icon: '◇' },
+    { label: 'paused', status: 'paused', color: '#ffbe0b', icon: '◇' },
+    { label: 'done', status: 'completed', color: '#00f5d4', icon: '' },
+    { label: 'error', status: 'error', color: '#ff006e', icon: '' },
   ] as const;
 
   let activeTabIndex = 0;
@@ -250,32 +231,51 @@ function main(): void {
   function getTabCounts(): Record<string, number> {
     const visibleLoops = getVisibleLoops();
     return {
-      All: visibleLoops.length,
-      Running: visibleLoops.filter(l => l.status === 'running').length,
-      Paused: visibleLoops.filter(l => l.status === 'paused').length,
-      Completed: visibleLoops.filter(l => l.status === 'completed').length,
-      Errors: visibleLoops.filter(l => l.status === 'error').length,
+      ALEx: visibleLoops.length,
+      running: visibleLoops.filter(l => l.status === 'running').length,
+      paused: visibleLoops.filter(l => l.status === 'paused').length,
+      done: visibleLoops.filter(l => l.status === 'completed').length,
+      error: visibleLoops.filter(l => l.status === 'error').length,
     };
+  }
+
+  function updateHeader(): void {
+    updateTabBar();
   }
 
   function updateTabBar(): void {
     const counts = getTabCounts();
     let leftOffset = 1;
     tabButtons.forEach((button, index) => {
-      const label = tabDefs[index].label;
+      const def = tabDefs[index];
+      const label = def.label;
       const count = counts[label];
       const isActive = index === activeTabIndex;
-      const content = isActive
-        ? `{bold}{#000000-fg} ${label} ${count} {/}{/bold}`
-        : `{#666666-fg} ${label} {#ff4fd8-fg}${count}{/} {/}`;
+      const icon = def.icon ? `${def.icon} ` : '';
+
+      let content: string;
+      if (label === 'ALEx') {
+        content = isActive
+          ? `{bold}{#000000-fg} ${icon}${label} {/}{/bold}`
+          : `{${def.color}-fg} ${icon}${label} {/}`;
+      } else {
+        content = isActive
+          ? `{bold}{#000000-fg} ${count} ${label} {/}{/bold}`
+          : `{${def.color}-fg}${count}{/} ${label}`;
+      }
+
       button.setContent(content);
-      button.style.bg = isActive ? '#ff4fd8' : 'black';
+      button.style.bg = isActive ? def.color : 'black';
       button.style.fg = isActive ? 'black' : '#666666';
       button.style.bold = isActive;
-      const width = `${label} ${count}`.length + 4;
+
+      const textLen = label === 'ALEx'
+        ? `${icon}${label}`.length
+        : `${count} ${label}`.length;
+      const width = textLen + 2;
       button.width = width;
       button.left = leftOffset;
-      leftOffset += width + 1;
+      leftOffset += width + 2;
     });
   }
 
@@ -300,16 +300,148 @@ function main(): void {
   });
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // ABOUT BUTTON (top right corner)
+  // ═══════════════════════════════════════════════════════════════════════════
+  const aboutButton = blessed.button({
+    parent: tabBar,
+    top: 0,
+    right: 1,
+    width: 3,
+    height: 1,
+    content: '{#666666-fg}?{/}',
+    tags: true,
+    mouse: true,
+    keys: true,
+    style: {
+      fg: '#666666',
+      bg: 'black',
+      focus: { fg: '#ff4fd8' },
+      hover: { fg: '#ff4fd8' },
+    },
+  } as any);
+
+  aboutButton.on('press', () => showAboutModal());
+
+  function showAboutModal(): void {
+    // Read VERSION file
+    let version = '0.0.0';
+    try {
+      version = fs.readFileSync(path.join(process.cwd(), 'VERSION'), 'utf-8').trim();
+    } catch {}
+
+    // Read alex.txt ASCII art
+    let alexArt = '';
+    try {
+      const animDir = path.join(path.dirname(new URL(import.meta.url).pathname), 'animations');
+      alexArt = fs.readFileSync(path.join(animDir, 'alex.txt'), 'utf-8');
+    } catch {}
+
+    // Create fullscreen modal
+    const modal = blessed.box({
+      parent: screen,
+      top: 0,
+      left: 0,
+      width: '100%',
+      height: '100%',
+      tags: true,
+      keys: true,
+      style: { fg: 'white', bg: 'black' },
+    } as any);
+
+    // Rainbow colors for lava lamp effect
+    const rainbowColors = [
+      '#ff0000', '#ff3300', '#ff6600', '#ff9900', '#ffcc00', '#ffff00',
+      '#ccff00', '#99ff00', '#66ff00', '#33ff00', '#00ff00', '#00ff33',
+      '#00ff66', '#00ff99', '#00ffcc', '#00ffff', '#00ccff', '#0099ff',
+      '#0066ff', '#0033ff', '#0000ff', '#3300ff', '#6600ff', '#9900ff',
+      '#cc00ff', '#ff00ff', '#ff00cc', '#ff0099', '#ff0066', '#ff0033',
+    ];
+    let tick = 0;
+
+    // Render content with lava lamp animated alex.txt
+    function renderContent(): void {
+      const artLines = alexArt.split('\n');
+      const w = (screen.width as number) || 80;
+      const artWidth = artLines[0]?.length || 0;
+      const leftPad = Math.max(0, Math.floor((w - artWidth) / 2));
+
+      // Lava lamp: each line gets a different color offset that flows
+      const coloredArt = artLines.map((line, lineIdx) => {
+        const colorIdx = (tick + lineIdx * 2) % rainbowColors.length;
+        const color = rainbowColors[colorIdx];
+        return ' '.repeat(leftPad) + `{${color}-fg}${line}{/}`;
+      }).join('\n');
+
+      // Pulsing effect - sine wave from light to dark
+      const pulse = Math.sin(tick * 0.4) * 0.5 + 0.5; // 0 to 1, faster
+
+      // Pink pulse for "Alex Haynes"
+      const pinkR = Math.round(80 + pulse * 175);
+      const pinkG = Math.round(20 + pulse * 40);
+      const pinkB = Math.round(80 + pulse * 136);
+      const pinkPulse = `#${pinkR.toString(16).padStart(2, '0')}${pinkG.toString(16).padStart(2, '0')}${pinkB.toString(16).padStart(2, '0')}`;
+
+      // Cyan pulse for "ALEx v{version}"
+      const cyanR = Math.round(20 + pulse * 25);
+      const cyanG = Math.round(80 + pulse * 146);
+      const cyanB = Math.round(80 + pulse * 150);
+      const cyanPulse = `#${cyanR.toString(16).padStart(2, '0')}${cyanG.toString(16).padStart(2, '0')}${cyanB.toString(16).padStart(2, '0')}`;
+
+      // Build content
+      const content = [
+        '',
+        '',
+        `{center}{bold}{${cyanPulse}-fg}ALEx v${version}{/}{/bold}{/center}`,
+        '',
+        `{center}{${colors.pink}-fg}Another Loop Experience{/}{/center}`,
+        `{center}{#eaeaea-fg}Digital Materials Inc - Freeware Program{/}{/center}`,
+        `{center}{#eaeaea-fg}created by {/}{${pinkPulse}-fg}Alex Haynes{/}{/center}`,
+        '',
+        `{center}{#888888-fg}Made in Brooklyn, New York, USA{/}{/center}`,
+        '',
+        '',
+        coloredArt,
+        '',
+        '',
+        `{center}{#666666-fg}[Esc/Enter] Close{/}{/center}`,
+      ].join('\n');
+
+      modal.setContent(content);
+      screen.render();
+    }
+
+    // Animate lava lamp flow (~150ms for smooth effect)
+    const animInterval = setInterval(() => {
+      tick++;
+      renderContent();
+    }, 150);
+
+    renderContent();
+
+    // Close handler bound to screen
+    let aboutModalOpen = true;
+    const closeModal = (): void => {
+      if (!aboutModalOpen) return;
+      aboutModalOpen = false;
+      clearInterval(animInterval);
+      modal.destroy();
+      screen.render();
+    };
+
+    screen.key(['escape', 'enter', 'q'], closeModal);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // LOOP LIST
   // ═══════════════════════════════════════════════════════════════════════════
   const loopListWindow = blessed.list({
     parent: screen,
     label: ' {bold}{#ff4fd8-fg}◆ LOOPS{/} ',
     tags: true,
-    top: 2,
+    top: 1,
     left: 1,
     width: '30%-2',
-    height: '100%-4',
+    height: '100%-3',
     keys: true,
     mouse: true,
     vi: true,
@@ -327,7 +459,16 @@ function main(): void {
   } as any);
 
   let loopListData: Loop[] = [];
+  let loopListScrollOffset = 0;
+  const loopTitleMaxChars = 22;
 
+  // Start loop list title scroll animation (if enabled)
+  if (SCROLLING_TEXT_ENABLED) {
+    setInterval(() => {
+      loopListScrollOffset++;
+      updateLoopList();
+    }, 200);
+  }
 
   function formatDuration(startedAt?: string, endedAt?: string): string {
     if (!startedAt) return '--';
@@ -375,13 +516,25 @@ function main(): void {
       const icon = statusIcons[loop.status] || '?';
       const color = loop.hidden ? '#666666' : (statusColors[loop.status] || colors.text);
       const time = formatDuration(loop.startedAt, loop.endedAt);
-      const prefix = loop.agent === 'claude' ? 'CLA' : 'CDX';
-      const title = loop.issue.title.substring(0, 22);
+      const prefixMap: Record<string, string> = { claude: 'CLA', codex: 'CDX', gemini: 'GEM' };
+      const prefix = prefixMap[loop.agent] || loop.agent.substring(0, 3).toUpperCase();
+      const rawTitle = loop.issue.title;
+      let title: string;
+      if (rawTitle.length <= loopTitleMaxChars) {
+        title = rawTitle;
+      } else if (SCROLLING_TEXT_ENABLED) {
+        // Scrolling text for long titles
+        const paddedTitle = rawTitle + '     ' + rawTitle;
+        const offset = loopListScrollOffset % (rawTitle.length + 5);
+        title = paddedTitle.slice(offset, offset + loopTitleMaxChars);
+      } else {
+        title = rawTitle.substring(0, loopTitleMaxChars) + '...';
+      }
       // Show indicator for paused loops from previous session
       const prevSess = loop.pausedFromPreviousSession ? ' {#ffbe0b-fg}◀prev{/}' : '';
       const hiddenTag = loop.hidden ? ' {#666-fg}[hidden]{/}' : '';
       const titleColor = loop.hidden ? '666666' : 'ffffff';
-      return ` {${color}-fg}${icon}{/} {#${titleColor}-fg}{bold}${prefix} #${loop.issue.number}{/} ${title}...{/}${prevSess}${hiddenTag} {#666-fg}${time}{/}`;
+      return ` {${color}-fg}${icon}{/} {#${titleColor}-fg}{bold}${prefix} #${loop.issue.number}{/} ${title}{/}${prevSess}${hiddenTag} {#666-fg}${time}{/}`;
     });
     loopListWindow.setItems(items);
   }
@@ -449,10 +602,10 @@ function main(): void {
     parent: screen,
     label: ' {bold}{#2de2e6-fg}◆ LOOP DETAIL{/} ',
     tags: true,
-    top: 2,
+    top: 1,
     left: '30%',
     width: '70%-1',
-    height: '50%-2',
+    height: '50%-1',
     border: 'line',
     style: {
       fg: 'white',
@@ -510,16 +663,37 @@ function main(): void {
       ? `  {#666-fg}│{/}  {#9b5de5-fg}Paused:{/} ${new Date(loop.pausedAt).toLocaleString()}`
       : '';
 
+    // Review workflow indicators
+    const reviewIndicator = loop.isReviewLoop
+      ? ' {#ff4fd8-fg}◆ REVIEW{/}'
+      : '';
+    const worktreeIndicator = loop.worktreePath
+      ? `  {#666-fg}│{/}  {#9b5de5-fg}Worktree:{/} ${loop.worktreeBranch || 'active'}`
+      : '';
+
     const logPath = getLogPath(loop.id);
     let content =
       `{bold}{#fff-fg}${loop.issue.title}{/}{/bold}\n` +
       `{#666-fg}─────────────────────────────────────────────────────{/}\n` +
-      `{${statusColor}-fg}${statusIcon} ${loop.status.toUpperCase()}{/}${hiddenIndicator}${prevSessionIndicator}  {#666-fg}│{/}  ` +
+      `{${statusColor}-fg}${statusIcon} ${loop.status.toUpperCase()}{/}${hiddenIndicator}${prevSessionIndicator}${reviewIndicator}  {#666-fg}│{/}  ` +
       `{#9b5de5-fg}Agent:{/} ${loop.agent}  {#666-fg}│{/}  ` +
       `{#9b5de5-fg}Time:{/} ${time}  {#666-fg}│{/}  ` +
       `{#9b5de5-fg}Iteration{/} ${iteration}/${maxIterations}  {#666-fg}│{/}  ` +
-      `{#9b5de5-fg}Issue:{/} #${loop.issue.number}${issueStatus}${pausedAtInfo}\n` +
-      `{#9b5de5-fg}Log:{/} ${logPath}\n\n`;
+      `{#9b5de5-fg}Issue:{/} #${loop.issue.number}${issueStatus}${pausedAtInfo}${worktreeIndicator}\n` +
+      `{#9b5de5-fg}Log:{/} ${logPath}\n`;
+
+    // Show review links
+    if (loop.reviewLoopId) {
+      const reviewLoop = state.loops.find(l => l.id === loop.reviewLoopId);
+      const reviewStatus = reviewLoop?.status || 'unknown';
+      const reviewStatusColor = statusColors[reviewStatus as LoopStatus] || '#666';
+      content += `{#ff4fd8-fg}Review:{/} {${reviewStatusColor}-fg}${reviewStatus}{/} {#666-fg}(V to view){/}\n`;
+    }
+    if (loop.parentLoopId) {
+      const parentLoop = state.loops.find(l => l.id === loop.parentLoopId);
+      content += `{#ff4fd8-fg}Reviewing:{/} ${parentLoop?.issue.title || loop.parentLoopId} {#666-fg}(V to view original){/}\n`;
+    }
+    content += '\n';
 
     content += `{#ffbe0b-fg}━━━ Acceptance Criteria ━━━{/}\n`;
 
@@ -605,7 +779,7 @@ function main(): void {
     top: '50%',
     left: '30%',
     width: '70%-1',
-    height: '50%-2',
+    height: '50%-1',
     keys: true,
     vi: true,
     border: 'line',
@@ -826,6 +1000,7 @@ function main(): void {
     const newLoop = '{#ff4fd8-fg}[N]{/}ew';
     const refresh = '{#ff4fd8-fg}[T]{/} Refresh';
     const viewLogs = '{#ff4fd8-fg}[L]{/} Logs';
+    const metrics = '{#9b5de5-fg}[M]{/}etrics';
     const toggleHidden = showHidden
       ? '{#ffbe0b-fg}[H]{/} Show visible'
       : '{#ffbe0b-fg}[H]{/} Show hidden';
@@ -836,25 +1011,30 @@ function main(): void {
 
     let actions = '';
     if (!loop) {
-      actions = `${newLoop} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${metrics} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'running') {
-      actions = `${newLoop} ${refresh} ${viewLogs} {#ff4fd8-fg}[P]{/}ause {#ff4fd8-fg}[S]{/}top {#ff4fd8-fg}[I]{/}ntervene ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} ${metrics} {#ff4fd8-fg}[P]{/}ause {#ff4fd8-fg}[S]{/}top {#ff4fd8-fg}[I]{/}ntervene ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'paused') {
       const isPrevSession = loop.pausedFromPreviousSession;
       const discardAction = isPrevSession ? ' {#ff4fd8-fg}[D]{/}iscard' : '';
       const resumeLabel = isPrevSession ? ' Resume(rebuild)' : ' Resume';
-      actions = `${newLoop} ${refresh} ${viewLogs} {#ff4fd8-fg}[P]{/}${resumeLabel} {#ff4fd8-fg}[S]{/}top${discardAction} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} ${metrics} {#ff4fd8-fg}[P]{/}${resumeLabel} {#ff4fd8-fg}[S]{/}top${discardAction} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'queued') {
-      actions = `${newLoop} ${refresh} ${viewLogs} {#2de2e6-fg}Enter{/} Start {#ff4fd8-fg}[S]{/} Delete ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} ${metrics} {#2de2e6-fg}Enter{/} Start {#ff4fd8-fg}[S]{/} Delete ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'error') {
-      actions = `${newLoop} ${refresh} ${viewLogs} {#ffbe0b-fg}[R] RETRY{/} {#ffbe0b-fg}[M] Mark Complete{/} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} ${metrics} {#ffbe0b-fg}[R] RETRY{/} {#ffbe0b-fg}[C] Mark Complete{/} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'stopped') {
-      actions = `${newLoop} ${refresh} ${viewLogs} {#ffbe0b-fg}[R] RETRY{/} {#ffbe0b-fg}[M] Mark Complete{/} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} ${metrics} {#ffbe0b-fg}[R] RETRY{/} {#ffbe0b-fg}[C] Mark Complete{/} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else if (loop.status === 'completed') {
       const closeIssueAction = loop.issueClosed ? '' : ` {#ff4fd8-fg}[C]{/}lose Issue`;
-      actions = `${newLoop} ${refresh} ${viewLogs}${closeIssueAction} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      const reviewAction = loop.reviewLoopId
+        ? ' {#ff4fd8-fg}[V]{/} View Review'
+        : loop.isReviewLoop
+          ? ' {#ff4fd8-fg}[V]{/} View Original'
+          : ' {#ff4fd8-fg}[V]{/} Request Review';
+      actions = `${newLoop} ${refresh} ${viewLogs} ${metrics}${reviewAction}${closeIssueAction} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     } else {
-      actions = `${newLoop} ${refresh} ${viewLogs} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
+      actions = `${newLoop} ${refresh} ${viewLogs} ${metrics} ${visibilityActions} {#666-fg}│{/} ${nav} {#666-fg}│{/} ${quit}`;
     }
 
     statusBar.setContent(` ${actions}`);
@@ -1151,7 +1331,7 @@ function main(): void {
           tags: true,
           top: 'center',
           left: 'center',
-          width: 80,
+          width: 100,
           height: 20,
           border: 'line',
           style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
@@ -1172,7 +1352,7 @@ function main(): void {
           parent: modal,
           top: 3,
           left: 2,
-          width: 74,
+          width: 94,
           height: 12,
           border: 'line',
           scrollable: true,
@@ -1191,17 +1371,37 @@ function main(): void {
 
         let selectedIndex = 0;
         let editModal: blessed.Widgets.BoxElement | null = null;
+        let scrollOffset = 0;
+        let scrollInterval: ReturnType<typeof setInterval> | null = null;
+        const maxVisibleChars = 82; // Account for line number prefix
 
         const renderList = (): void => {
           const items = criteriaDraft.map((c, i) => {
             const num = `{#666-fg}${String(i + 1).padStart(2)}.{/}`;
-            const text = c.text || '{#666-fg}(empty){/}';
-            return ` ${num} ${text}`;
+            const rawText = c.text || '';
+            if (!rawText) return ` ${num} {#666-fg}(empty){/}`;
+
+            const textLen = rawText.length;
+            if (textLen <= maxVisibleChars) {
+              return ` ${num} ${rawText}`;
+            }
+
+            // Scrolling text for long items
+            const paddedText = rawText + '     ' + rawText; // Loop with gap
+            const offset = scrollOffset % (textLen + 5);
+            const visibleText = paddedText.slice(offset, offset + maxVisibleChars);
+            return ` ${num} ${visibleText}`;
           });
           listBox.setItems(items);
           listBox.select(selectedIndex);
           screen.render();
         };
+
+        // Start scroll animation for long AC text
+        scrollInterval = setInterval(() => {
+          scrollOffset++;
+          renderList();
+        }, 200);
 
         const startEditing = (index: number): void => {
           if (editModal) return;
@@ -1214,7 +1414,7 @@ function main(): void {
             tags: true,
             top: 'center',
             left: 'center',
-            width: 70,
+            width: 90,
             height: 10,
             border: 'line',
             style: { fg: 'white', bg: 'black', border: { fg: 'yellow' } },
@@ -1225,7 +1425,7 @@ function main(): void {
             parent: editModal,
             top: 1,
             left: 1,
-            width: 66,
+            width: 86,
             height: 5,
             style: {
               fg: 'white',
@@ -1306,12 +1506,16 @@ function main(): void {
 
         const closeCriteriaModal = (): void => {
           stopEditing();
+          if (scrollInterval) {
+            clearInterval(scrollInterval);
+            scrollInterval = null;
+          }
           modal.destroy();
           loopListWindow.focus();
           screen.render();
         };
 
-        const finalizeCriteria = (): void => {
+        const finalizeCriteria = async (): Promise<void> => {
           stopEditing();
 
           const nextCriteria = criteriaDraft
@@ -1332,7 +1536,7 @@ function main(): void {
             logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
           }
 
-          const loop = createLoop(updatedIssue, selectedAgent, skipPermissions, repoRoot, maxIterations);
+          const loop = await createLoop(updatedIssue, selectedAgent, skipPermissions, repoRoot, maxIterations);
 
           state = loadState();
           updateLoopList();
@@ -1876,16 +2080,374 @@ function main(): void {
     }
   });
 
-  // M - Mark errored/stopped loop as completed (with confirmation)
-  screen.key(['m', 'M'], () => {
+  // V - Navigate to review/parent loop, or request review
+  screen.key(['v'], () => {
     if (isAnyInputActive()) return;
     if (!selectedLoopId) return;
     const loop = state.loops.find(l => l.id === selectedLoopId);
     if (!loop) return;
 
-    if (loop.status !== 'error' && loop.status !== 'stopped') {
-      logWithGlow('{#ff006e-fg}[error]{/} Can only mark ERROR or STOPPED loops as complete', 'error');
+    // Navigate to review loop if exists
+    if (loop.reviewLoopId) {
+      const reviewLoop = state.loops.find(l => l.id === loop.reviewLoopId);
+      if (reviewLoop) {
+        selectedLoopId = reviewLoop.id;
+        updateLoopList();
+        updateDetailPane(reviewLoop);
+        updateStatusBar(reviewLoop);
+        loadLogsForLoop(reviewLoop.id);
+        screen.render();
+        return;
+      }
+    }
+
+    // Navigate to parent loop if this is a review
+    if (loop.parentLoopId) {
+      const parentLoop = state.loops.find(l => l.id === loop.parentLoopId);
+      if (parentLoop) {
+        selectedLoopId = parentLoop.id;
+        updateLoopList();
+        updateDetailPane(parentLoop);
+        updateStatusBar(parentLoop);
+        loadLogsForLoop(parentLoop.id);
+        screen.render();
+        return;
+      }
+    }
+
+    // Otherwise request a review if loop is completed
+    if (loop.status === 'completed' && !loop.reviewLoopId && !loop.isReviewLoop) {
+      showReviewAgentSelector(loop);
+    }
+  });
+
+  // Shift+V - Request review (show agent selector)
+  screen.key(['S-v', 'V'], () => {
+    if (isAnyInputActive()) return;
+    if (!selectedLoopId) return;
+    const loop = state.loops.find(l => l.id === selectedLoopId);
+    if (!loop) return;
+
+    if (loop.status !== 'completed') {
+      logWithGlow('{#ffbe0b-fg}[system]{/} Can only review completed loops', 'system');
       screen.render();
+      return;
+    }
+    if (loop.reviewLoopId) {
+      logWithGlow('{#ffbe0b-fg}[system]{/} Loop already has a review', 'system');
+      screen.render();
+      return;
+    }
+    if (loop.isReviewLoop) {
+      logWithGlow('{#ffbe0b-fg}[system]{/} Cannot review a review loop', 'system');
+      screen.render();
+      return;
+    }
+
+    showReviewAgentSelector(loop);
+  });
+
+  // Show agent selector modal for requesting review
+  function showReviewAgentSelector(loop: Loop): void {
+    const adapters = getAvailableAdapters().filter(a => a.type !== loop.agent);
+    if (adapters.length === 0) {
+      logWithGlow('{#ff006e-fg}[error]{/} No different agents available for review', 'error');
+      screen.render();
+      return;
+    }
+
+    const modal = blessed.box({
+      parent: screen,
+      label: ' {bold}{#ff4fd8-fg}◆ REQUEST REVIEW{/} ',
+      tags: true,
+      top: 'center',
+      left: 'center',
+      width: 50,
+      height: adapters.length + 6,
+      border: 'line',
+      style: { fg: 'white', bg: 'black', transparent: true, border: { fg: '#ff4fd8' } },
+      shadow: true,
+    } as any);
+
+    blessed.text({
+      parent: modal,
+      top: 1,
+      left: 2,
+      tags: true,
+      content: `{#9b5de5-fg}Select reviewer agent:{/}`,
+    });
+
+    const agentList = blessed.list({
+      parent: modal,
+      top: 3,
+      left: 2,
+      width: '90%',
+      height: adapters.length,
+      tags: true,
+      keys: true,
+      vi: true,
+      mouse: true,
+      style: {
+        fg: 'white',
+        selected: { fg: 'black', bg: '#ff4fd8' },
+      },
+      items: adapters.map(a => a.displayName || a.type),
+    } as any);
+
+    agentList.focus();
+    screen.render();
+
+    agentList.on('select', async (_item: any, index: number) => {
+      const selectedAgent = adapters[index];
+      modal.destroy();
+      screen.render();
+
+      try {
+        logWithGlow(`{#ff4fd8-fg}[review]{/} Creating review with ${selectedAgent.type}...`, 'system');
+        screen.render();
+
+        const reviewLoop = await createReviewLoop(loop.id, selectedAgent.type);
+
+        // Start the review loop
+        startLoop(reviewLoop.id).catch((err: Error) => {
+          logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+          screen.render();
+        });
+
+        // Update UI
+        state = loadState();
+        updateLoopList();
+        updateHeader();
+        updateTabBar();
+
+        // Select the new review loop
+        selectedLoopId = reviewLoop.id;
+        const updatedReviewLoop = state.loops.find(l => l.id === reviewLoop.id);
+        if (updatedReviewLoop) {
+          updateDetailPane(updatedReviewLoop);
+          updateStatusBar(updatedReviewLoop);
+          loadLogsForLoop(reviewLoop.id);
+        }
+
+        logWithGlow(`{#ff4fd8-fg}[review]{/} Review loop started`, 'system');
+        screen.render();
+      } catch (err: any) {
+        logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+        screen.render();
+      }
+    });
+
+    agentList.key(['escape', 'q'], () => {
+      modal.destroy();
+      screen.render();
+    });
+  }
+
+  // Function to handle closing a GitHub issue (extracted for reuse)
+  function handleCloseIssue(loop: Loop): void {
+    if (loop.issueClosed) {
+      logWithGlow('{#ffbe0b-fg}[system]{/} Issue already closed', 'system');
+      screen.render();
+      return;
+    }
+
+    const modal = blessed.box({
+      parent: screen,
+      label: ' {bold}{#ff4fd8-fg}◆ CLOSE ISSUE{/} ',
+      tags: true,
+      top: 'center',
+      left: 'center',
+      width: 70,
+      height: 12,
+      border: 'line',
+      style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
+      shadow: true,
+    } as any);
+
+    blessed.text({
+      parent: modal,
+      top: 1,
+      left: 2,
+      tags: true,
+      content: `{#eaeaea-fg}Optional comment for issue #${loop.issue.number}:{/}`,
+    });
+
+    const commentInput = createCursorInput({
+      parent: modal,
+      top: 3,
+      left: 2,
+      width: 64,
+      height: 3,
+      style: { fg: 'white', bg: 'black', border: { fg: 'cyan' }, focus: { border: { fg: 'magenta' } } },
+    }, screen);
+
+    const inputManager = createInputManager<ManagedInput>({
+      onActivate: () => screen.render(),
+    });
+
+    commentInput.on('click', () => inputManager.activate(commentInput));
+    setTimeout(() => inputManager.activate(commentInput), 50);
+
+    const closeModal = (): void => {
+      modal.destroy();
+      loopListWindow.focus();
+      screen.render();
+    };
+
+    const showConfirm = (comment?: string): void => {
+      const confirm = blessed.box({
+        parent: screen,
+        label: ' {bold}{#ff4fd8-fg}◆ CONFIRM{/} ',
+        tags: true,
+        top: 'center',
+        left: 'center',
+        width: 50,
+        height: 7,
+        border: 'line',
+        style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
+        shadow: true,
+      } as any);
+
+      blessed.text({
+        parent: confirm,
+        top: 1,
+        left: 2,
+        tags: true,
+        content: `{#eaeaea-fg}Close issue #${loop.issue.number}?{/}`,
+      });
+
+      const yesBtn = blessed.button({
+        parent: confirm,
+        top: 3,
+        left: 2,
+        width: 10,
+        height: 1,
+        content: 'Yes',
+        align: 'center',
+        style: { fg: 'black', bg: 'magenta', bold: true, hover: { bg: 'cyan' } },
+        mouse: true,
+      } as any);
+
+      const noBtn = blessed.button({
+        parent: confirm,
+        top: 3,
+        left: 14,
+        width: 10,
+        height: 1,
+        content: 'No',
+        align: 'center',
+        style: { fg: 'white', bg: 240, hover: { bg: 'red' } },
+        mouse: true,
+      } as any);
+
+      const closeConfirm = (): void => {
+        confirm.destroy();
+        screen.render();
+      };
+
+      const doCloseIssue = (): void => {
+        closeConfirm();
+        closeModal();
+
+        try {
+          const result = closeIssue(loop.issue.url, comment);
+          let nextState = loadState();
+          nextState = updateLoop(nextState, loop.id, { issueClosed: true });
+          saveState(nextState);
+          state = nextState;
+
+          const updatedLoop = state.loops.find(l => l.id === loop.id);
+          updateLoopList();
+          updateHeader();
+          updateTabBar();
+          const selectionChanged = syncSelectionAfterFilter();
+          if (!selectionChanged && updatedLoop) {
+            updateDetailPane(updatedLoop);
+            updateStatusBar(updatedLoop);
+          }
+
+          if (result === 'already_closed') {
+            logWithGlow(`{#ffbe0b-fg}[system]{/} Issue #${loop.issue.number} was already closed`, 'system');
+          } else {
+            logWithGlow(`{#00f5d4-fg}[system]{/} Closed issue #${loop.issue.number}`, 'system');
+          }
+        } catch (err: any) {
+          logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
+        }
+        screen.render();
+      };
+
+      yesBtn.on('press', doCloseIssue);
+      noBtn.on('press', () => {
+        closeConfirm();
+        closeModal();
+      });
+
+      confirm.key(['y', 'Y', 'enter'], doCloseIssue);
+      confirm.key(['n', 'N', 'escape'], () => {
+        closeConfirm();
+        closeModal();
+      });
+
+      confirm.focus();
+      screen.render();
+    };
+
+    const closeBtn = blessed.button({
+      parent: modal,
+      top: 7,
+      left: 2,
+      width: 12,
+      height: 1,
+      content: 'Close',
+      align: 'center',
+      style: { fg: 'black', bg: 'magenta', bold: true, hover: { bg: 'cyan' } },
+      mouse: true,
+    } as any);
+
+    const cancelBtn = blessed.button({
+      parent: modal,
+      top: 7,
+      left: 16,
+      width: 12,
+      height: 1,
+      content: 'Cancel',
+      align: 'center',
+      style: { fg: 'white', bg: 240, hover: { bg: 'red' } },
+      mouse: true,
+    } as any);
+
+    const proceedToConfirm = (): void => {
+      const comment = commentInput.getValue().trim();
+      showConfirm(comment || undefined);
+    };
+
+    closeBtn.on('press', proceedToConfirm);
+    cancelBtn.on('press', closeModal);
+    commentInput.key(['enter'], proceedToConfirm);
+    commentInput.key(['escape'], closeModal);
+    modal.key(['escape', 'S-tab'], closeModal);
+    modal.key(['y', 'Y', 'enter'], proceedToConfirm);
+
+    screen.render();
+  }
+
+  // C - Mark errored/stopped loop as completed, OR close issue for completed loops
+  screen.key(['c', 'C'], () => {
+    if (isAnyInputActive()) return;
+    if (!selectedLoopId) return;
+    const loop = state.loops.find(l => l.id === selectedLoopId);
+    if (!loop) return;
+
+    // Route to appropriate action based on status
+    if (loop.status === 'completed') {
+      // Delegate to Close Issue logic (defined below as handleCloseIssue)
+      handleCloseIssue(loop);
+      return;
+    }
+
+    if (loop.status !== 'error' && loop.status !== 'stopped') {
+      // No action for running/paused/queued loops
       return;
     }
 
@@ -1996,206 +2558,6 @@ function main(): void {
     screen.render();
   });
 
-  // C - Close issue for completed loop (with confirmation)
-  screen.key(['c', 'C'], () => {
-    if (isAnyInputActive()) return;
-    if (!selectedLoopId) return;
-    const loop = state.loops.find(l => l.id === selectedLoopId);
-    if (!loop) return;
-
-    if (loop.status !== 'completed') {
-      logWithGlow('{#ff006e-fg}[error]{/} Can only close issues for completed loops', 'error');
-      screen.render();
-      return;
-    }
-
-    if (loop.issueClosed) {
-      logWithGlow('{#ffbe0b-fg}[system]{/} Issue already closed', 'system');
-      screen.render();
-      return;
-    }
-
-    const modal = blessed.box({
-      parent: screen,
-      label: ' {bold}{#ff4fd8-fg}◆ CLOSE ISSUE{/} ',
-      tags: true,
-      top: 'center',
-      left: 'center',
-      width: 70,
-      height: 12,
-      border: 'line',
-      style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
-      shadow: true,
-    } as any);
-
-    blessed.text({
-      parent: modal,
-      top: 1,
-      left: 2,
-      tags: true,
-      content: `{#eaeaea-fg}Optional comment for issue #${loop.issue.number}:{/}`,
-    });
-
-    const commentInput = createCursorInput({
-      parent: modal,
-      top: 3,
-      left: 2,
-      width: 64,
-      height: 3,
-      style: { fg: 'white', bg: 'black', border: { fg: 'cyan' }, focus: { border: { fg: 'magenta' } } },
-    }, screen);
-
-    const inputManager = createInputManager<ManagedInput>({
-      onActivate: () => screen.render(),
-    });
-
-    commentInput.on('click', () => inputManager.activate(commentInput));
-    setTimeout(() => inputManager.activate(commentInput), 50);
-
-    const closeModal = (): void => {
-      modal.destroy();
-      loopListWindow.focus();
-      screen.render();
-    };
-
-    const showConfirm = (comment?: string): void => {
-      const confirm = blessed.box({
-        parent: screen,
-        label: ' {bold}{#ff4fd8-fg}◆ CONFIRM{/} ',
-        tags: true,
-        top: 'center',
-        left: 'center',
-        width: 50,
-        height: 7,
-        border: 'line',
-        style: { fg: 'white', bg: 'blue', transparent: true, border: { fg: 'magenta' } },
-        shadow: true,
-      } as any);
-
-      blessed.text({
-        parent: confirm,
-        top: 1,
-        left: 2,
-        tags: true,
-        content: `{#eaeaea-fg}Close issue #${loop.issue.number}?{/}`,
-      });
-
-      const yesBtn = blessed.button({
-        parent: confirm,
-        top: 3,
-        left: 2,
-        width: 10,
-        height: 1,
-        content: 'Yes',
-        align: 'center',
-        style: { fg: 'black', bg: 'magenta', bold: true, hover: { bg: 'cyan' } },
-        mouse: true,
-      } as any);
-
-      const noBtn = blessed.button({
-        parent: confirm,
-        top: 3,
-        left: 14,
-        width: 10,
-        height: 1,
-        content: 'No',
-        align: 'center',
-        style: { fg: 'white', bg: 240, hover: { bg: 'red' } },
-        mouse: true,
-      } as any);
-
-      const closeConfirm = (): void => {
-        confirm.destroy();
-        screen.render();
-      };
-
-      const handleCloseIssue = (): void => {
-        closeConfirm();
-        closeModal();
-
-        try {
-          const result = closeIssue(loop.issue.url, comment);
-          let nextState = loadState();
-          nextState = updateLoop(nextState, loop.id, { issueClosed: true });
-          saveState(nextState);
-          state = nextState;
-
-          const updatedLoop = state.loops.find(l => l.id === loop.id);
-          updateLoopList();
-          updateHeader();
-          updateTabBar();
-          const selectionChanged = syncSelectionAfterFilter();
-          if (!selectionChanged && updatedLoop) {
-            updateDetailPane(updatedLoop);
-            updateStatusBar(updatedLoop);
-          }
-
-          if (result === 'already_closed') {
-            logWithGlow(`{#ffbe0b-fg}[system]{/} Issue #${loop.issue.number} was already closed`, 'system');
-          } else {
-            logWithGlow(`{#00f5d4-fg}[system]{/} Closed issue #${loop.issue.number}`, 'system');
-          }
-        } catch (err: any) {
-          logWithGlow(`{#ff006e-fg}[error]{/} ${err.message}`, 'error');
-        }
-        screen.render();
-      };
-
-      yesBtn.on('press', handleCloseIssue);
-      noBtn.on('press', () => {
-        closeConfirm();
-        closeModal();
-      });
-
-      confirm.key(['y', 'Y', 'enter'], handleCloseIssue);
-      confirm.key(['n', 'N', 'escape'], () => {
-        closeConfirm();
-        closeModal();
-      });
-
-      confirm.focus();
-      screen.render();
-    };
-
-    const closeBtn = blessed.button({
-      parent: modal,
-      top: 7,
-      left: 2,
-      width: 12,
-      height: 1,
-      content: 'Close',
-      align: 'center',
-      style: { fg: 'black', bg: 'magenta', bold: true, hover: { bg: 'cyan' } },
-      mouse: true,
-    } as any);
-
-    const cancelBtn = blessed.button({
-      parent: modal,
-      top: 7,
-      left: 16,
-      width: 12,
-      height: 1,
-      content: 'Cancel',
-      align: 'center',
-      style: { fg: 'white', bg: 240, hover: { bg: 'red' } },
-      mouse: true,
-    } as any);
-
-    const proceedToConfirm = (): void => {
-      const comment = commentInput.getValue().trim();
-      showConfirm(comment || undefined);
-    };
-
-    closeBtn.on('press', proceedToConfirm);
-    cancelBtn.on('press', closeModal);
-    commentInput.key(['enter'], proceedToConfirm);
-    commentInput.key(['escape'], closeModal);
-    modal.key(['escape', 'S-tab'], closeModal);
-    modal.key(['y', 'Y', 'enter'], proceedToConfirm);
-
-    screen.render();
-  });
-
   // I - Intervene
   screen.key(['i', 'I'], () => {
     if (isAnyInputActive()) return;
@@ -2274,6 +2636,207 @@ function main(): void {
     const loop = state.loops.find(l => l.id === selectedLoopId);
     if (!loop) return;
     openLogViewer(loop);
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // METRICS DASHBOARD
+  // ═══════════════════════════════════════════════════════════════════════════
+  let metricsDashboard: blessed.Widgets.BoxElement | null = null;
+  let metricsIncludeHidden = true;
+
+  function openMetricsDashboard(): void {
+    if (metricsDashboard) {
+      closeMetricsDashboard();
+      return;
+    }
+
+    const metrics: DashboardMetrics = calculateMetrics(state.loops, metricsIncludeHidden, METRICS_TREND_DAYS, METRICS_TREND_WEEKS, METRICS_TOP_FAILURES);
+    const w = (screen.width as number) || 120;
+    const h = (screen.height as number) || 40;
+
+    metricsDashboard = blessed.box({
+      parent: screen,
+      label: ' {bold}{#ff4fd8-fg}◆ METRICS DASHBOARD{/} ',
+      tags: true,
+      top: 1,
+      left: 2,
+      width: w - 4,
+      height: h - 4,
+      border: 'line',
+      keys: true,
+      vi: true,
+      mouse: true,
+      scrollable: true,
+      alwaysScroll: true,
+      scrollbar: { ch: '█', style: { bg: 'magenta' } },
+      style: {
+        fg: 'white',
+        bg: 'black',
+        transparent: true,
+        border: { fg: '#ff4fd8' },
+        label: { fg: '#ff4fd8' },
+      },
+      padding: { left: 1, right: 1, top: 0, bottom: 0 },
+    } as any);
+
+    const contentWidth = w - 10;
+    const barWidth = Math.floor(contentWidth * 0.4);
+
+    // Build dashboard content
+    let content = '';
+
+    // ─── SUMMARY SECTION ───
+    content += `{bold}{#ff4fd8-fg}◆ SUMMARY{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    const { summary } = metrics;
+    const totalNonZero = summary.total || 1;
+    content += `  Total Loops:    {#2de2e6-fg}${summary.total}{/}\n`;
+    content += `  Completed:      {#00f5d4-fg}${summary.completed}{/} (${Math.round((summary.completed / totalNonZero) * 100)}%)\n`;
+    content += `  Failed:         {#ff006e-fg}${summary.failed}{/} (${Math.round((summary.failed / totalNonZero) * 100)}%)\n`;
+    content += `  In Progress:    {#2de2e6-fg}${summary.inProgress}{/}\n`;
+    content += `  Paused:         {#ffbe0b-fg}${summary.paused}{/}\n`;
+    content += `  Queued:         {#666-fg}${summary.queued}{/}\n`;
+    content += `  Stopped:        {#666-fg}${summary.stopped}{/}\n\n`;
+
+    // ─── TIME TO COMPLETION ───
+    content += `{bold}{#ff4fd8-fg}◆ TIME TO COMPLETION{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    content += `  Average: {#2de2e6-fg}${formatDurationMs(metrics.avgTimeToCompletionMs)}{/}\n\n`;
+
+    // ─── PER-AGENT SUCCESS RATES ───
+    content += `{bold}{#ff4fd8-fg}◆ PER-AGENT SUCCESS RATES{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    if (metrics.perAgent.length === 0) {
+      content += `  {#666-fg}No agent data yet.{/}\n`;
+    } else {
+      for (const agent of metrics.perAgent) {
+        const bar = renderHorizontalBar(agent.successRate, 100, barWidth);
+        const avgDur = formatDurationMs(agent.avgDurationMs);
+        content += `  {#9b5de5-fg}${agent.agent.padEnd(10)}{/} ${bar} {#2de2e6-fg}${Math.round(agent.successRate)}%{/}  ${agent.loopsRun} runs  avg ${avgDur}\n`;
+      }
+    }
+    content += '\n';
+
+    // ─── DAILY COMPLETIONS ───
+    content += `{bold}{#ff4fd8-fg}◆ DAILY COMPLETIONS (${METRICS_TREND_DAYS} DAYS){/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    const dailyValues = metrics.dailyTrend.map(d => d.completed);
+    const chartHeight = 6;
+    const chartLines = renderVerticalBars(dailyValues, chartHeight, 2, 1);
+    for (const line of chartLines) {
+      content += `  {#2de2e6-fg}${line}{/}\n`;
+    }
+    // Labels - show day of month (DD from YYYY-MM-DD)
+    const labelLine = metrics.dailyTrend.map(d => d.date.slice(8)).join(' ');
+    content += `  {#666-fg}${labelLine}{/}\n\n`;
+
+    // ─── ITERATION STATS ───
+    content += `{bold}{#ff4fd8-fg}◆ ITERATION STATS{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    const { iterationStats } = metrics;
+    content += `  Average iterations: {#2de2e6-fg}${iterationStats.avgIterations.toFixed(1)}{/}\n`;
+    content += `  Min: {#00f5d4-fg}${iterationStats.minIterations}{/}  Max: {#ff006e-fg}${iterationStats.maxIterations}{/}\n`;
+    content += `  Total iterations:   {#666-fg}${iterationStats.totalIterations}{/}\n\n`;
+
+    // ─── TOP FAILURE REASONS ───
+    content += `{bold}{#ff4fd8-fg}◆ TOP FAILURE REASONS{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    if (metrics.topFailureReasons.length === 0) {
+      content += `  {#00f5d4-fg}No failures recorded!{/}\n`;
+    } else {
+      const maxFail = Math.max(...metrics.topFailureReasons.map(r => r.count), 1);
+      for (const reason of metrics.topFailureReasons) {
+        const bar = renderHorizontalBar(reason.count, maxFail, Math.floor(barWidth / 2));
+        content += `  {#ff006e-fg}${reason.reason.padEnd(18)}{/} ${bar} {#666-fg}${reason.count}{/}\n`;
+      }
+    }
+    content += '\n';
+
+    // ─── CIRCUIT BREAKER STATS ───
+    content += `{bold}{#ff4fd8-fg}◆ CIRCUIT BREAKER TRIGGERS{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    const { circuitBreakerStats } = metrics;
+    content += `  Total triggers: {#ffbe0b-fg}${circuitBreakerStats.totalTriggers}{/}\n`;
+    content += `  └─ no_progress:     {#ff006e-fg}${circuitBreakerStats.byReason.noProgress}{/}\n`;
+    content += `  └─ same_error:      {#ff006e-fg}${circuitBreakerStats.byReason.sameError}{/}\n`;
+    content += `  └─ test_saturation: {#ffbe0b-fg}${circuitBreakerStats.byReason.testSaturation}{/}\n`;
+    content += `  └─ other:           {#666-fg}${circuitBreakerStats.byReason.other}{/}\n\n`;
+
+    // ─── HOURLY ACTIVITY HEATMAP ───
+    content += `{bold}{#ff4fd8-fg}◆ HOURLY ACTIVITY HEATMAP{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    const hourlyValues = metrics.hourlyActivity.map(h => h.count);
+    const heatmap = renderHeatmap(hourlyValues);
+    content += `  {#2de2e6-fg}${heatmap}{/}\n`;
+    content += `  {#666-fg}12am      6am       12pm      6pm       12am{/}\n`;
+    const peakHour = metrics.hourlyActivity.reduce((max, h) => h.count > max.count ? h : max, { hour: 0, count: 0 });
+    content += `  Peak: {#ffbe0b-fg}${peakHour.hour}:00{/} (${peakHour.count} loops)\n\n`;
+
+    // ─── CRITERIA COMPLETION ───
+    content += `{bold}{#ff4fd8-fg}◆ CRITERIA COMPLETION{/}{/bold}\n`;
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    const { criteriaStats } = metrics;
+    const agentPct = criteriaStats.totalCriteria > 0 ? Math.round((criteriaStats.agentCompleted / criteriaStats.totalCriteria) * 100) : 0;
+    const operatorPct = criteriaStats.totalCriteria > 0 ? Math.round((criteriaStats.operatorCompleted / criteriaStats.totalCriteria) * 100) : 0;
+    content += `  Total criteria:     {#666-fg}${criteriaStats.totalCriteria}{/}\n`;
+    content += `  Agent completed:    {#00f5d4-fg}${criteriaStats.agentCompleted}{/} (${agentPct}%)\n`;
+    content += `  Operator completed: {#ffbe0b-fg}${criteriaStats.operatorCompleted}{/} (${operatorPct}%)\n`;
+    content += `  Completion rate:    {#2de2e6-fg}${Math.round(criteriaStats.completionRate)}%{/}\n\n`;
+
+    // ─── FOOTER ───
+    const hiddenStatus = metricsIncludeHidden ? 'included' : 'excluded';
+    content += `{#666-fg}${'─'.repeat(Math.min(contentWidth, 60))}{/}\n`;
+    content += `  {#ff4fd8-fg}[E]{/} Export JSON  {#ff4fd8-fg}[H]{/} Toggle hidden (${hiddenStatus})  {#ff4fd8-fg}[Esc]{/} Close\n`;
+
+    metricsDashboard.setContent(content);
+    metricsDashboard.focus();
+    screen.render();
+  }
+
+  function closeMetricsDashboard(): void {
+    if (metricsDashboard) {
+      metricsDashboard.destroy();
+      metricsDashboard = null;
+      loopListWindow.focus();
+      screen.render();
+    }
+  }
+
+  function exportMetricsFunc(): void {
+    const metrics: DashboardMetrics = calculateMetrics(state.loops, metricsIncludeHidden, METRICS_TREND_DAYS, METRICS_TREND_WEEKS, METRICS_TOP_FAILURES);
+    const json = exportMetricsToJson(metrics);
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const filePath = path.join(DATA_DIR, `metrics-export-${timestamp}.json`);
+    fs.writeFileSync(filePath, json);
+    logWithGlow(`{#00f5d4-fg}[system]{/} Metrics exported to ${filePath}`, 'system');
+    screen.render();
+  }
+
+  // M - Open metrics dashboard
+  screen.key(['m', 'M'], () => {
+    if (isAnyInputActive()) return;
+    openMetricsDashboard();
+  });
+
+  // Dashboard-specific keys when open
+  screen.key(['escape'], () => {
+    if (metricsDashboard) {
+      closeMetricsDashboard();
+    }
+  });
+
+  screen.key(['e', 'E'], () => {
+    if (metricsDashboard) {
+      exportMetricsFunc();
+    }
+  });
+
+  screen.key(['h'], () => {
+    if (metricsDashboard) {
+      metricsIncludeHidden = !metricsIncludeHidden;
+      closeMetricsDashboard();
+      openMetricsDashboard();
+    }
   });
 
   // T - Refresh issue data
@@ -2356,4 +2919,35 @@ function main(): void {
   screen.render();
 }
 
-main();
+// CLI routing
+const { command, flags } = parseArgs();
+
+if (command === 'configure') {
+  runConfigure(flags);
+  process.exit(0);
+} else if (command === 'clean') {
+  runClean(flags).then(() => process.exit(0)).catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else if (command === 'uninstall') {
+  const dryRun = flags['--dry-run'] === true;
+  runUninstallWizard(dryRun).catch((err) => {
+    console.error(err);
+    process.exit(1);
+  });
+} else if (command === 'help') {
+  showHelp();
+  process.exit(0);
+} else {
+  // Default: launch TUI (with optional tutorial)
+  if (shouldShowTutorial(flags)) {
+    const screen = createScreen();
+    runTutorial(screen).then(() => {
+      screen.destroy();
+      main();
+    });
+  } else {
+    main();
+  }
+}

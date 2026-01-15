@@ -4,3 +4,6 @@ export * from './state.js';
 export * from './issues.js';
 export * from './logs.js';
 export * from './loops.js';
+export * from './metrics.js';
+export * from './worktree.js';
+export * from './review.js';
