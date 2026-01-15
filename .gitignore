@@ -197,3 +197,4 @@ cmake/sources/*.txt
 
 # Custom Ignore
 /data
+**/*.mov
